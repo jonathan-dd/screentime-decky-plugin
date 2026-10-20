@@ -26,6 +26,7 @@ DAILY_LIMIT_S = 7200.0          # Tageslimit: 2 Stunden Spielzeit
 MANUAL_SUSPEND_GAP_S = 30.0     # Wanduhr-Sprung > 30 s zwischen Ticks => Suspend/Wake
 TOAST_AFTER_WAKE_S = 20.0       # In der Pause: Toast erst nach 20 Sekunden Wachzeit
 RESUSPEND_AFTER_TOAST_S = 10.0  # In der Pause: 10 s nach dem Toast erneut Ruhemodus
+SUSPEND_RETRY_S = 5.0           # Suspend fehlgeschlagen => alle 5 s erneut anfordern
 TICK_S = 1.0                    # Tick-Intervall des Hintergrund-Loops
 PERSIST_DEBOUNCE_S = 10.0       # Statusdatei sparsam schreiben: max. alle 10 s
 STATE_FILE = 'state.json'
@@ -59,6 +60,9 @@ class Plugin:
         self.break_start_wall = 0.0   # Wanduhr-Zeitpunkt des Pausenbeginns
         self.awake_s = 0.0            # Wachzeit seit dem letzten Wake (in der Pause)
         self.suspend_pending = False  # Suspend ausgelöst, auf Wake warten
+        # Wachzeit-Marke des letzten suspend_now-Emits (Tick-basiert, zur
+        # Retry-Logik in der Pause): seit dieser Marke >= 5 s wach => erneut emit.
+        self.last_suspend_emit = 0.0
         self.break_toast_shown = False
         # Zeitmarker des letzten Ticks
         self.last_wall = time.time()
@@ -150,7 +154,10 @@ class Plugin:
         # 1) Wanduhr-Sprung > 30 s: Das Gerät war im Suspend (der Prozess war
         #    eingefroren, ein Tick hat die Schlafzeit nicht gesehen).
         if gap > MANUAL_SUSPEND_GAP_S:
+            # Wake erkannt: Suspend wurde bestätigt — Suspend-Flags und
+            # Retry-Marke für den neuen Wach-Zyklus zurücksetzen.
             self.suspend_pending = False
+            self.last_suspend_emit = 0.0
             if self.state == STATE_PLAYING:
                 if self.warned:
                     # Manueller Ruhemodus nach der Vorankündigung: Die Pause
@@ -202,7 +209,9 @@ class Plugin:
                 self.state = STATE_PLAYING if self.game_running else STATE_IDLE
                 self.session_s = 0.0
                 self.warned = False
+                # Pause-Ende: alle Pausen-Marker inkl. Suspend-Retry zurücksetzen.
                 self.suspend_pending = False
+                self.last_suspend_emit = 0.0
                 self.break_toast_shown = False
                 await decky.emit('break_over', int(limit // 60))
             else:
@@ -213,9 +222,15 @@ class Plugin:
                     remaining_min = max(1, math.ceil((BREAK_S - elapsed) / 60))
                     await decky.emit('show_break_toast', remaining_min)
                 if (self.awake_s >= TOAST_AFTER_WAKE_S + RESUSPEND_AFTER_TOAST_S
-                        and not self.suspend_pending):
-                    # Erneut in den Ruhemodus, bis die Pause um ist.
+                        and (not self.suspend_pending
+                             or (self.awake_s - self.last_suspend_emit) >= SUSPEND_RETRY_S)):
+                    # Erneut in den Ruhemodus, bis die Pause um ist. suspend_pending
+                    # sorgt nur für den ersten Emit sofort nach dem Wake (Toast bleibt
+                    # davor lesbar); ist das Gerät danach weiterhin wach, ist der
+                    # Suspend fehlgeschlagen => alle 5 s erneut anfordern, bis der
+                    # Wanduhr-Sprung den Suspend bestätigt (Retry-Marke last_suspend_emit).
                     self.suspend_pending = True
+                    self.last_suspend_emit = self.awake_s
                     await decky.emit('suspend_now')
         elif self.game_running:
             if self.state == STATE_IDLE:
@@ -247,7 +262,13 @@ class Plugin:
                     self.break_start_wall = now_wall
                     self.awake_s = 0.0
                     self.break_toast_shown = False
+                    # Erster Suspend beim Sitzungsende — bleibt wie er ist. Schlägt er
+                    # fehl (Gerät bleibt wach), greift ab awake_s >= 30 (Toast nach 20 s
+                    # + 10 s) die Retry-Logik unten: alle 5 s erneut, bis der
+                    # Wanduhr-Sprung den Suspend bestätigt. D. h. bis zu 30 s
+                    # Verzögerung beim Session-Ende-Suspend, dann Retry alle 5 s.
                     self.suspend_pending = True
+                    self.last_suspend_emit = 0.0
                     await decky.emit('suspend_now')
 
         # 6) Persistenz (debounced, max. alle 10 s).
@@ -265,6 +286,9 @@ class Plugin:
                 # Suspend/Wake missdeutet wird.
                 self.last_wall = time.time()
                 self.last_mono = time.monotonic()
+                # Suspend-Retry-Marke ebenfalls nachziehen: nach einem Fehler-Tick
+                # im 5-s-Rhythmus neu starten statt sofort erneut zu emit.
+                self.last_suspend_emit = self.awake_s
             await asyncio.sleep(TICK_S)
 
     # --- Lifecycle (vom Decky-Loader aufgerufen) ---
