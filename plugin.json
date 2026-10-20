@@ -1,0 +1,15 @@
+{
+    "name": "ScreenTime",
+    "author": "Jonathan Dechow",
+    "version": "1.0.0",
+    "main": "main.py",
+    "flags": [],
+    "api_version": 1,
+    "publish": {
+        "tags": [
+            "utility",
+            "screen-time"
+        ],
+        "description": "Erzwingt regelmäßige Spielpausen: Sitzungen begrenzen, rechtzeitig warnen und das Gerät in den Ruhemodus versetzen."
+    }
+}
