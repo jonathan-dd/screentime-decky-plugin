@@ -1,0 +1,89 @@
+name: Build & Release
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Read version from plugin.json
+        id: version
+        run: echo "version=$(node -p "require('./plugin.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Package zip
+        run: |
+          mkdir -p /tmp/package
+          cp LICENSE README.md main.py package.json plugin.json /tmp/package/
+          cp -r dist /tmp/package/
+          cd /tmp/package
+          zip -r "$GITHUB_WORKSPACE/ScreenTime.zip" .
+
+      - name: Check if version increased (push only)
+        id: check
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          latest_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          latest_ver="${latest_tag#v}"
+          if [ -z "$latest_ver" ]; then
+            echo "No existing release found, will publish."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          elif [ "$(printf '%s\n%s\n' "$latest_ver" "$VERSION" | sort -V | tail -n1)" = "$VERSION" ] && [ "$VERSION" != "$latest_ver" ]; then
+            echo "Version increased from $latest_ver to $VERSION, will publish."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $VERSION not higher than latest release $latest_ver, skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          should_release=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run: replacing release v$VERSION if it exists."
+            gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+            should_release=true
+          elif [ "${{ steps.check.outputs.should_release }}" = "true" ]; then
+            should_release=true
+          fi
+
+          if [ "$should_release" = "true" ]; then
+            gh release create "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "ScreenTime v$VERSION" \
+              --generate-notes \
+              ScreenTime.zip
+          else
+            echo "Skipping release."
+          fi
