@@ -12,7 +12,11 @@ const findModule = (property: string) => {
                     return m[prop];
                 }
             } catch {
-                return undefined;
+                // Zugriff auf m[prop] kann bei manchen Modulen werfen (z. B.
+                // Getter mit Seiteneffekten). Dieses Modul überspringen und
+                // weitersuchen — NICHT die gesamte Modulsuche abbrechen,
+                // sonst bleibt SleepParent undefined und Suspend fällt still.
+                continue;
             }
         }
     });

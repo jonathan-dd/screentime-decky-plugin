@@ -37,28 +37,61 @@ const textStyle: CSSProperties = {
 };
 
 function Content() {
-    const [status, setStatus] = useState<ScreenTimeState | null>(null);
+    // Letzter Poll-Stand: Backend-Antwort + Poll-Zeitpunkt. Die Countdown-
+    // Anzeige interpoliert daraus lokal weiter; der 2-s-Poll korrigiert Drift.
+    const [poll, setPoll] = useState<{ s: ScreenTimeState; at: number } | null>(null);
+    // 250-ms-Tick treibt die lokale Anzeige zwischen den 2-s-Polls an.
+    const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
-    // Status alle 2 s pollen, solange das Panel geöffnet ist
+    // Anzeige lokal im 250-ms-Interval weiterlaufen lassen, statt nur
+    // sprunghaft mit jedem 2-s-Poll zu aktualisieren.
+    useEffect(() => {
+        const timer = setInterval(() => setNowTick(Date.now()), 250);
+        return () => clearInterval(timer);
+    }, []);
+
+    // Status alle 2 s pollen, solange das Panel geöffnet ist (Synchronisation).
     useEffect(() => {
         let mounted = true;
-        const poll = async () => {
+        let lastState: ScreenTimeState["state"] | undefined;
+        const pollState = async (): Promise<void> => {
             try {
                 const s = await getStateCall();
-                if (mounted && s) setStatus(s);
+                if (!mounted || !s) return;
+                const prevState = lastState;
+                lastState = s.state;
+                setPoll({ s, at: Date.now() });
+                if (prevState !== undefined && s.state !== prevState) {
+                    // Zustandswechsel erkannt: sofort nochmal pollen für frische
+                    // Restzeiten, statt auf den nächsten 2-s-Tick zu warten.
+                    void pollState();
+                }
             } catch (e) {
                 console.error("ScreenTime: Statusabfrage fehlgeschlagen.", e);
             }
         };
-        void poll();
+        void pollState();
         const interval = setInterval(() => {
-            void poll();
+            void pollState();
         }, 2000);
         return () => {
             mounted = false;
             clearInterval(interval);
         };
     }, []);
+
+    const status = poll?.s ?? null;
+
+    // Restzeit (Session/Pause) lokal dekrementieren: seit dem Poll verstrichene
+    // Zeit abziehen, auf 0 geklemmt — Drift korrigiert der nächste Poll.
+    let countdown: number | null = null;
+    if (poll && status && (status.state === "playing" || status.state === "breaking")) {
+        const polled = status.state === "playing"
+            ? status.session_remaining_s
+            : status.break_remaining_s;
+        const elapsed = Math.max(0, (nowTick - poll.at) / 1000);
+        countdown = Math.max(0, polled - elapsed);
+    }
 
     const statusText = !status
         ? "Status: Lade …"
@@ -81,7 +114,7 @@ function Content() {
                         checked={status.enabled}
                         onChange={(checked: boolean) => {
                             // Optimistisch umschalten; der 2-Sekunden-Poll gleicht aus.
-                            setStatus({ ...status, enabled: checked });
+                            setPoll((p) => (p ? { ...p, s: { ...p.s, enabled: checked } } : p));
                             void setEnabledCall(checked);
                         }}
                     />
@@ -97,14 +130,14 @@ function Content() {
                     </div>
                 </PanelSectionRow>
             )}
-            {status?.state === "playing" && (
+            {status?.state === "playing" && countdown !== null && (
                 <PanelSectionRow>
-                    <div style={textStyle}>{`Session endet in ${formatMMSS(status.session_remaining_s)}`}</div>
+                    <div style={textStyle}>{`Session endet in ${formatMMSS(countdown)}`}</div>
                 </PanelSectionRow>
             )}
-            {status?.state === "breaking" && (
+            {status?.state === "breaking" && countdown !== null && (
                 <PanelSectionRow>
-                    <div style={textStyle}>{`Pause endet in ${formatMMSS(status.break_remaining_s)}`}</div>
+                    <div style={textStyle}>{`Pause endet in ${formatMMSS(countdown)}`}</div>
                 </PanelSectionRow>
             )}
         </PanelSection>
@@ -133,9 +166,11 @@ export default definePlugin(() => {
     };
 
     const onSuspendNow = () => {
-        // Direkt suspendieren — kein setTimeout nötig. Der Backend-Tick friert
-        // mit ein und erkennt das Aufwachen am Wanduhr-Sprung.
-        void SteamUtils.suspend();
+        // Wie AlarMe: 3 s warten, bis der Steam-UI (Toasts/Events) bereit ist —
+        // ein sofortiger Aufruf schlägt sonst still fehl. Wiederholte Emits des
+        // Backends (Retry alle 5 s) sind dadurch harmlos, der Aufruf ist idempotent.
+        // Der Backend-Tick friert mit ein und erkennt das Aufwachen am Wanduhr-Sprung.
+        setTimeout(() => SteamUtils.suspend(), 3000);
     };
 
     addEventListener("show_warning", onShowWarning);
