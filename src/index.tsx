@@ -1,6 +1,6 @@
-import { PanelSection, PanelSectionRow, ToggleField, staticClasses } from "@decky/ui";
+import { Button, PanelSection, PanelSectionRow, SliderField, TextField, ToggleField, staticClasses } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { FaClock } from "react-icons/fa";
 
@@ -11,8 +11,15 @@ import { SteamUtils } from "./utils/steam";
 
 // --- IPC zum Python-Backend ---
 const setGameRunningCall = callable<[is_running: boolean], void>("set_game_running");
-const setEnabledCall = callable<[enabled: boolean], void>("set_enabled");
+const setEnabledCall = callable<[enabled: boolean], boolean>("set_enabled");
 const getStateCall = callable<[], ScreenTimeState>("get_state");
+const pinStatusCall = callable<[], PinStatus>("pin_status");
+const setupPinCall = callable<[pin: string], boolean>("setup_pin");
+const unlockCall = callable<[pin: string], boolean>("unlock");
+const lockCall = callable<[], void>("lock");
+const setPinCall = callable<[current_pin: string, new_pin: string], boolean>("set_pin");
+const getSettingsCall = callable<[], ScreenTimeSettings>("get_settings");
+const setSettingsCall = callable<[settings: ScreenTimeSettings], Record<string, number>>("set_settings");
 
 // Status, wie ihn das Backend über get_state() liefert
 interface ScreenTimeState {
@@ -23,6 +30,23 @@ interface ScreenTimeState {
     break_remaining_s: number;
     total_play_min_today: number;
     limit_min: number;
+    pin_configured: boolean;
+    pin_unlocked: boolean;
+}
+
+// Einstellbare Werte (Minuten; warn in Sekunden). Ranges/Clamp macht das Backend.
+interface ScreenTimeSettings {
+    session_minutes: number;
+    break_minutes: number;
+    daily_limit_minutes: number;
+    reduced_session_minutes: number;
+    warn_before_seconds: number;
+}
+
+interface PinStatus {
+    configured: boolean;
+    unlocked: boolean;
+    lockout_remaining_s: number;
 }
 
 // Sekunden als mm:ss formatieren
@@ -36,12 +60,52 @@ const textStyle: CSSProperties = {
     fontSize: "14px",
 };
 
+const hintStyle: CSSProperties = {
+    ...textStyle,
+    color: "#aaa",
+};
+
+const errorStyle: CSSProperties = {
+    ...textStyle,
+    color: "#ff6b6b",
+};
+
+const buttonRowStyle: CSSProperties = {
+    display: "flex",
+    gap: "8px",
+    marginTop: "6px",
+};
+
+// PIN-Länge (muss zum Backend passen: 4–8 Zeichen)
+const PIN_MIN = 4;
+const PIN_MAX = 8;
+
+const pinLengthOk = (pin: string): boolean =>
+    pin.length >= PIN_MIN && pin.length <= PIN_MAX;
+
 function Content() {
     // Letzter Poll-Stand: Backend-Antwort + Poll-Zeitpunkt. Die Countdown-
     // Anzeige interpoliert daraus lokal weiter; der 2-s-Poll korrigiert Drift.
     const [poll, setPoll] = useState<{ s: ScreenTimeState; at: number } | null>(null);
+    // Lockout-Restzeit aus pin_status (gleicher 2-s-Zyklus wie get_state).
+    const [pinLockoutS, setPinLockoutS] = useState(0);
     // 250-ms-Tick treibt die lokale Anzeige zwischen den 2-s-Polls an.
     const [nowTick, setNowTick] = useState<number>(() => Date.now());
+
+    // Einstellungen (Slider-Werte, optimistisch; Backend bestätigt/clampt).
+    const [settings, setSettings] = useState<ScreenTimeSettings | null>(null);
+    const settingsRef = useRef<ScreenTimeSettings | null>(null);
+    const settingsTimer = useRef<number | undefined>(undefined);
+
+    // PIN-Eingaben ( Setup / Unlock / Ändern )
+    const [setupPin, setSetupPin] = useState("");
+    const [setupPinConfirm, setSetupPinConfirm] = useState("");
+    const [unlockPin, setUnlockPin] = useState("");
+    const [changeOpen, setChangeOpen] = useState(false);
+    const [changeCur, setChangeCur] = useState("");
+    const [changeNew, setChangeNew] = useState("");
+    const [changeNewConfirm, setChangeNewConfirm] = useState("");
+    const [pinError, setPinError] = useState<string | null>(null);
 
     // Anzeige lokal im 250-ms-Interval weiterlaufen lassen, statt nur
     // sprunghaft mit jedem 2-s-Poll zu aktualisieren.
@@ -69,6 +133,12 @@ function Content() {
             } catch (e) {
                 console.error("ScreenTime: Statusabfrage fehlgeschlagen.", e);
             }
+            try {
+                const ps = await pinStatusCall();
+                if (mounted && ps) setPinLockoutS(ps.lockout_remaining_s);
+            } catch {
+                /* pin_status ist optional für die Anzeige */
+            }
         };
         void pollState();
         const interval = setInterval(() => {
@@ -81,6 +151,107 @@ function Content() {
     }, []);
 
     const status = poll?.s ?? null;
+    const pinConfigured = status?.pin_configured ?? false;
+    const unlocked = status?.pin_unlocked ?? false;
+
+    // Einstellungen beim ersten Entsperren laden (get_settings ist offen/lesend).
+    useEffect(() => {
+        if (!unlocked || settingsRef.current) return;
+        void getSettingsCall()
+            .then((s) => {
+                if (s) {
+                    setSettings(s);
+                    settingsRef.current = s;
+                }
+            })
+            .catch((e) => console.error("ScreenTime: Einstellungen nicht lesbar.", e));
+    }, [unlocked]);
+
+    // Debounced Slider-Batch: alle 400 ms nach der letzten Änderung senden;
+    // akzeptierte (geclampte) Werte inline zurückspiegeln. Fehler (z. B.
+    // zwischenzeitlich gesperrt) => der 2-s-Poll zieht das Panel zurück
+    // in den Sperr-Zustand.
+    const scheduleSettingsSend = () => {
+        if (settingsTimer.current !== undefined) {
+            window.clearTimeout(settingsTimer.current);
+        }
+        settingsTimer.current = window.setTimeout(() => {
+            settingsTimer.current = undefined;
+            const current = settingsRef.current;
+            if (!current) return;
+            void setSettingsCall(current)
+                .then((accepted) => {
+                    if (accepted && Object.keys(accepted).length === 5) {
+                        const fixed = accepted as unknown as ScreenTimeSettings;
+                        settingsRef.current = fixed;
+                        setSettings(fixed);
+                    }
+                })
+                .catch((e) => console.error("ScreenTime: Einstellungen nicht gespeichert.", e));
+        }, 400);
+    };
+
+    useEffect(() => () => {
+        if (settingsTimer.current !== undefined) window.clearTimeout(settingsTimer.current);
+    }, []);
+
+    const onSettingChange = (key: keyof ScreenTimeSettings, value: number) => {
+        setSettings((prev) => {
+            if (!prev) return prev;
+            const next = { ...prev, [key]: value };
+            settingsRef.current = next;
+            return next;
+        });
+        scheduleSettingsSend();
+    };
+
+    // --- PIN-Aktionen ---
+
+    const doSetupPin = async () => {
+        if (!pinLengthOk(setupPin) || setupPin !== setupPinConfirm) return;
+        const ok = await setupPinCall(setupPin);
+        setSetupPin("");
+        setSetupPinConfirm("");
+        setPinError(ok ? null : "PIN konnte nicht festgelegt werden.");
+    };
+
+    const doUnlock = async () => {
+        const ok = await unlockCall(unlockPin);
+        setUnlockPin("");
+        if (ok) {
+            setPinError(null);
+        } else {
+            setPinError(
+                pinLockoutS > 0
+                    ? `Zu viele Fehlversuche — gesperrt (${Math.ceil(pinLockoutS)} s)`
+                    : "Falsche PIN.",
+            );
+        }
+    };
+
+    const doChangePin = async () => {
+        if (!pinLengthOk(changeNew) || changeNew !== changeNewConfirm) return;
+        const ok = await setPinCall(changeCur, changeNew);
+        if (ok) {
+            setChangeOpen(false);
+            setChangeCur("");
+            setChangeNew("");
+            setChangeNewConfirm("");
+            setPinError(null);
+        } else {
+            setPinError("Ändern fehlgeschlagen — aktuelle PIN falsch?");
+        }
+    };
+
+    const doLock = () => {
+        setChangeOpen(false);
+        setChangeCur("");
+        setChangeNew("");
+        setChangeNewConfirm("");
+        setUnlockPin("");
+        setPinError(null);
+        void lockCall();
+    };
 
     // Restzeit (Session/Pause) lokal dekrementieren: seit dem Poll verstrichene
     // Zeit abziehen, auf 0 geklemmt — Drift korrigiert der nächste Poll.
@@ -103,23 +274,13 @@ function Content() {
                     ? "Status: Erzwungene Pause"
                     : "Status: Bereit (kein Spiel)";
 
+    const setupPinInvalid =
+        setupPin.length > 0 && (!pinLengthOk(setupPin) || setupPin !== setupPinConfirm);
+    const changeNewInvalid =
+        changeNew.length > 0 && (!pinLengthOk(changeNew) || changeNew !== changeNewConfirm);
+
     return (
         <PanelSection title="ScreenTime">
-            <PanelSectionRow>
-                {status === null ? (
-                    <div style={textStyle}>Status wird geladen …</div>
-                ) : (
-                    <ToggleField
-                        label="Aktiv"
-                        checked={status.enabled}
-                        onChange={(checked: boolean) => {
-                            // Optimistisch umschalten; der 2-Sekunden-Poll gleicht aus.
-                            setPoll((p) => (p ? { ...p, s: { ...p.s, enabled: checked } } : p));
-                            void setEnabledCall(checked);
-                        }}
-                    />
-                )}
-            </PanelSectionRow>
             <PanelSectionRow>
                 <div style={textStyle}>{statusText}</div>
             </PanelSectionRow>
@@ -139,6 +300,223 @@ function Content() {
                 <PanelSectionRow>
                     <div style={textStyle}>{`Pause endet in ${formatMMSS(countdown)}`}</div>
                 </PanelSectionRow>
+            )}
+
+            {/* --- PIN-Bereich --- */}
+            {status !== null && !pinConfigured && (
+                <>
+                    <PanelSectionRow>
+                        <div style={hintStyle}>Kein PIN gesetzt — Einstellungen sind ungeschützt. Jetzt PIN festlegen:</div>
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <TextField
+                            label="PIN (4–8 Zeichen)"
+                            value={setupPin}
+                            bIsPassword
+                            focusOnMount
+                            onChange={(e) => setSetupPin(e.target.value)}
+                        />
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <TextField
+                            label="PIN wiederholen"
+                            value={setupPinConfirm}
+                            bIsPassword
+                            onChange={(e) => setSetupPinConfirm(e.target.value)}
+                        />
+                    </PanelSectionRow>
+                    {setupPinInvalid && (
+                        <PanelSectionRow>
+                            <div style={errorStyle}>PIN muss 4–8 Zeichen lang sein und übereinstimmen.</div>
+                        </PanelSectionRow>
+                    )}
+                    {pinError && (
+                        <PanelSectionRow>
+                            <div style={errorStyle}>{pinError}</div>
+                        </PanelSectionRow>
+                    )}
+                    <PanelSectionRow>
+                        <Button onClick={() => void doSetupPin()} disabled={!pinLengthOk(setupPin) || setupPin !== setupPinConfirm}>
+                            PIN festlegen
+                        </Button>
+                    </PanelSectionRow>
+                </>
+            )}
+            {status !== null && pinConfigured && !unlocked && (
+                <>
+                    <PanelSectionRow>
+                        <div style={hintStyle}>Gesperrt — zum Ändern von Einstellungen entsperren:</div>
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <TextField
+                            label="PIN"
+                            value={unlockPin}
+                            bIsPassword
+                            focusOnMount
+                            onChange={(e) => setUnlockPin(e.target.value)}
+                        />
+                    </PanelSectionRow>
+                    {pinError && (
+                        <PanelSectionRow>
+                            <div style={errorStyle}>{pinError}</div>
+                        </PanelSectionRow>
+                    )}
+                    {pinLockoutS > 0 && (
+                        <PanelSectionRow>
+                            <div style={errorStyle}>{`Zu viele Fehlversuche — entsperrt in ${Math.ceil(pinLockoutS)} s`}</div>
+                        </PanelSectionRow>
+                    )}
+                    <PanelSectionRow>
+                        <Button onClick={() => void doUnlock()} disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}>
+                            Entsperren
+                        </Button>
+                    </PanelSectionRow>
+                </>
+            )}
+
+            {/* --- Einstellungen (nur entsperrt) --- */}
+            {status !== null && pinConfigured && unlocked && settings !== null && (
+                <>
+                    <PanelSectionRow>
+                        <ToggleField
+                            label="Aktiv"
+                            checked={status.enabled}
+                            onChange={(checked: boolean) => {
+                                // Optimistisch umschalten; bei Ablehnung (z. B.
+                                // zwischenzeitlich gesperrt) korrigiert der Poll.
+                                setPoll((p) => (p ? { ...p, s: { ...p.s, enabled: checked } } : p));
+                                void setEnabledCall(checked);
+                            }}
+                        />
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <SliderField
+                            label="Sitzungslänge"
+                            value={settings.session_minutes}
+                            min={5}
+                            max={180}
+                            step={5}
+                            showValue
+                            valueSuffix=" Min."
+                            onChange={(v: number) => onSettingChange("session_minutes", v)}
+                        />
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <SliderField
+                            label="Pausenlänge"
+                            value={settings.break_minutes}
+                            min={5}
+                            max={120}
+                            step={1}
+                            showValue
+                            valueSuffix=" Min."
+                            onChange={(v: number) => onSettingChange("break_minutes", v)}
+                        />
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <SliderField
+                            label="Tageslimit"
+                            value={settings.daily_limit_minutes}
+                            min={30}
+                            max={720}
+                            step={15}
+                            showValue
+                            valueSuffix=" Min."
+                            onChange={(v: number) => onSettingChange("daily_limit_minutes", v)}
+                        />
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <SliderField
+                            label="Sitzung nach Tageslimit"
+                            value={settings.reduced_session_minutes}
+                            min={1}
+                            max={60}
+                            step={1}
+                            showValue
+                            valueSuffix=" Min."
+                            onChange={(v: number) => onSettingChange("reduced_session_minutes", v)}
+                        />
+                    </PanelSectionRow>
+                    <PanelSectionRow>
+                        <SliderField
+                            label="Vorwarnung"
+                            value={settings.warn_before_seconds}
+                            min={15}
+                            max={300}
+                            step={15}
+                            showValue
+                            valueSuffix=" s"
+                            onChange={(v: number) => onSettingChange("warn_before_seconds", v)}
+                        />
+                    </PanelSectionRow>
+                    {!changeOpen ? (
+                        <PanelSectionRow>
+                            <div style={buttonRowStyle}>
+                                <Button onClick={() => setChangeOpen(true)}>PIN ändern</Button>
+                                <Button onClick={doLock}>Jetzt sperren</Button>
+                            </div>
+                        </PanelSectionRow>
+                    ) : (
+                        <>
+                            <PanelSectionRow>
+                                <TextField
+                                    label="Aktuelle PIN"
+                                    value={changeCur}
+                                    bIsPassword
+                                    focusOnMount
+                                    onChange={(e) => setChangeCur(e.target.value)}
+                                />
+                            </PanelSectionRow>
+                            <PanelSectionRow>
+                                <TextField
+                                    label="Neue PIN"
+                                    value={changeNew}
+                                    bIsPassword
+                                    onChange={(e) => setChangeNew(e.target.value)}
+                                />
+                            </PanelSectionRow>
+                            <PanelSectionRow>
+                                <TextField
+                                    label="Neue PIN wiederholen"
+                                    value={changeNewConfirm}
+                                    bIsPassword
+                                    onChange={(e) => setChangeNewConfirm(e.target.value)}
+                                />
+                            </PanelSectionRow>
+                            {changeNewInvalid && (
+                                <PanelSectionRow>
+                                    <div style={errorStyle}>Neue PIN muss 4–8 Zeichen lang sein und übereinstimmen.</div>
+                                </PanelSectionRow>
+                            )}
+                            {pinError && (
+                                <PanelSectionRow>
+                                    <div style={errorStyle}>{pinError}</div>
+                                </PanelSectionRow>
+                            )}
+                            <PanelSectionRow>
+                                <div style={buttonRowStyle}>
+                                    <Button
+                                        onClick={() => void doChangePin()}
+                                        disabled={!pinLengthOk(changeNew) || changeNew !== changeNewConfirm || changeCur.length < PIN_MIN}
+                                    >
+                                        PIN speichern
+                                    </Button>
+                                    <Button
+                                        onClick={() => {
+                                            setChangeOpen(false);
+                                            setChangeCur("");
+                                            setChangeNew("");
+                                            setChangeNewConfirm("");
+                                            setPinError(null);
+                                        }}
+                                    >
+                                        Abbrechen
+                                    </Button>
+                                </div>
+                            </PanelSectionRow>
+                        </>
+                    )}
+                </>
             )}
         </PanelSection>
     );

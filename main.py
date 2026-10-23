@@ -9,20 +9,20 @@
 # von mehr als 30 Sekunden zwischen zwei Ticks erkannt.
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import decky
 
 # --- Konstanten des Verhaltens (siehe README) ---
-SESSION_NORMAL_S = 1200.0       # Normale Sitzungslänge: 20 Minuten
-SESSION_REDUCED_S = 300.0       # Verkürzte Sitzung nach erreichtem Tageslimit: 5 Minuten
-BREAK_S = 600.0                 # Erzwungene Pause: 10 Minuten (Wanduhr, inkl. Schlafzeit)
-WARN_BEFORE_S = 60.0            # Vorankündigung: 60 Sekunden vor Sitzungsende
-DAILY_LIMIT_S = 7200.0          # Tageslimit: 2 Stunden Spielzeit
+# Die Zeit-Werte (Sitzung/Pause/Limit/Vorwarnung) sind jetzt einstellbar
+# (siehe SETTING_SPECS); die Defaults entsprechen den bisherigen Werten.
 MANUAL_SUSPEND_GAP_S = 30.0     # Wanduhr-Sprung > 30 s zwischen Ticks => Suspend/Wake
 TOAST_AFTER_WAKE_S = 20.0       # In der Pause: Toast erst nach 20 Sekunden Wachzeit
 RESUSPEND_AFTER_TOAST_S = 10.0  # In der Pause: 10 s nach dem Toast erneut Ruhemodus
@@ -30,6 +30,32 @@ SUSPEND_RETRY_S = 5.0           # Suspend fehlgeschlagen => alle 5 s erneut anfo
 TICK_S = 1.0                    # Tick-Intervall des Hintergrund-Loops
 PERSIST_DEBOUNCE_S = 10.0       # Statusdatei sparsam schreiben: max. alle 10 s
 STATE_FILE = 'state.json'
+
+# --- PIN-Schutz ---
+# Einstellungen und der Aktiv-Schalter sind gesperrt, bis per PIN entsperrt
+# wurde. Nach dem Entsperren bleibt das Panel 10 Minuten offen; jede
+# geschützte Aktion setzt die Frist neu.
+PIN_FILE = 'pin.json'           # bewusst SEPARAT von state.json: 'PIN vergessen'
+                                # => pin.json per Konsole löschen => Setup-Flow
+PIN_ITERATIONS = 100_000        # PBKDF2-HMAC-SHA256
+PIN_SALT_BYTES = 16             # 16-Byte-Random-Salt
+PIN_MIN_LEN = 4
+PIN_MAX_LEN = 8
+UNLOCK_TIMEOUT_S = 600.0        # 10 Minuten offen nach Unlock/geschützter Aktion
+LOCKOUT_S = 60.0                # 60 s Sperre nach 5 fehlgeschlagenen Versuchen
+MAX_FAILED_UNLOCK = 5
+
+# Einstellbare Werte: Key -> (Default, min, max). Minuten bzw. Sekunden.
+# Das Backend clampt JEDES Mal (IPC und Laden) — Frontend-Angaben werden
+# nie vertraut.
+SETTING_SPECS: Dict[str, Any] = {
+    'session_minutes':         (20, 5, 180),
+    'break_minutes':           (10, 5, 120),
+    'daily_limit_minutes':     (120, 30, 720),
+    'reduced_session_minutes': (5, 1, 60),
+    'warn_before_seconds':     (60, 15, 300),
+}
+DEFAULT_SETTINGS: Dict[str, int] = {k: spec[0] for k, spec in SETTING_SPECS.items()}
 
 STATE_IDLE = 'idle'
 STATE_PLAYING = 'playing'
@@ -41,8 +67,13 @@ class Plugin:
 
     IPC-Methoden (aus dem Frontend via @decky/api callable aufrufbar):
       - set_game_running(is_running): Frontend meldet Start/Stop einer Steam-App
-      - set_enabled(enabled):         Plugin an/aus (persistiert)
+      - set_enabled(enabled):         Plugin an/aus (persistiert, PIN-geschützt)
       - get_state():                  Status für das QAM-Panel
+      - get_settings()/set_settings(): Einstellungen lesen/ändern (ändern: geschützt)
+      - pin_status():                 PIN-Zustand (offen/lesend)
+      - setup_pin(pin):               Erste PIN festlegen (nur solange keine existiert)
+      - unlock(pin)/lock():           Entsperren (Rate-Limit) / manuell sperren
+      - set_pin(current_pin, new_pin): PIN ändern (braucht Unlock + aktuelle PIN)
     """
 
     def __init__(self):
@@ -52,6 +83,7 @@ class Plugin:
         self.enabled = True
         self.total_today_s = 0.0
         self.day = time.strftime('%Y-%m-%d')
+        self.settings: Dict[str, int] = dict(DEFAULT_SETTINGS)
         # Laufzeitzustand
         self.state = STATE_IDLE
         self.game_running = False
@@ -68,6 +100,10 @@ class Plugin:
         self.last_wall = time.time()
         self.last_mono = time.monotonic()
         self._last_persist_wall = 0.0
+        # PIN-Gate (nur In-Memory, nicht persistiert)
+        self.unlocked_until = 0.0     # Wanduhr; 0.0 = gesperrt
+        self.failed_unlocks = 0
+        self.lockout_until = 0.0      # Wanduhr; 0.0 = kein Lockout
 
     # --- Persistenz ---
 
@@ -106,6 +142,16 @@ class Plugin:
             # um Mitternacht zurücksetzen.
             self.day = today
             self.total_today_s = 0.0
+        # Einstellungen: fehlende Keys => Default; Werte clampen (Hand-Edit
+        # einer kaputten state.json soll nie außerhalb der Ranges landen).
+        saved_settings = data.get('settings')
+        if isinstance(saved_settings, dict):
+            merged: Dict[str, int] = dict(DEFAULT_SETTINGS)
+            for key, (_default, lo, hi) in SETTING_SPECS.items():
+                if key in saved_settings:
+                    merged[key] = self._clamp_value(saved_settings[key], lo, hi,
+                                                    _default)
+            self.settings = merged
         break_start = data.get('breaking_start_wall')
         if isinstance(break_start, (int, float)) and break_start > 0:
             # Unterbrochene Pause über einen Plugin-Neustart hinweg fortführen;
@@ -113,12 +159,25 @@ class Plugin:
             self.state = STATE_BREAKING
             self.break_start_wall = float(break_start)
 
+    @staticmethod
+    def _clamp_value(raw: Any, lo: int, hi: int, fallback: int) -> int:
+        """Einzelnen Einstellungs-Wert in [lo, hi] zwingen; unbrauchbar
+        (keine Zahl, NaN/inf) => fallback."""
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(val):
+            return fallback
+        return int(round(min(float(hi), max(float(lo), val))))
+
     def _persist_state(self, now_wall: float) -> None:
         """Status atomar als JSON schreiben (tmp-Datei + os.replace)."""
         data: Dict[str, Any] = {
             'day': self.day,
             'total_play_seconds': round(self.total_today_s, 3),
             'enabled': self.enabled,
+            'settings': dict(self.settings),
         }
         if self.state == STATE_BREAKING:
             data['breaking_start_wall'] = self.break_start_wall
@@ -137,13 +196,94 @@ class Plugin:
             self._persist_state(now_wall)
             self._last_persist_wall = now_wall
 
-    # --- Zustands-Logik ---
+    # --- Einstellungen (live gelesen, überall geclampt) ---
+
+    def _setting_s(self, key: str) -> float:
+        """Minuten-Einstellung in Sekunden."""
+        return float(self.settings.get(key, DEFAULT_SETTINGS[key])) * 60.0
+
+    def _warn_before_s(self) -> float:
+        return float(self.settings.get('warn_before_seconds',
+                                       DEFAULT_SETTINGS['warn_before_seconds']))
 
     def _current_limit_s(self) -> float:
-        """Sitzungslänge: verkürzt, sobald das Tageslimit erreicht ist."""
-        if self.total_today_s >= DAILY_LIMIT_S:
-            return SESSION_REDUCED_S
-        return SESSION_NORMAL_S
+        """Sitzungslänge: verkürzt, sobald das Tageslimit erreicht ist.
+
+        Live aus den Settings gelesen — Werte gelten sofort: Wird die
+        Sitzungslänge mitten in einer laufenden Sitzung unterschritten,
+        endet die Sitzung beim nächsten Tick (konsistent mit dem
+        bestehenden 2h-Cross-Trigger, der eine Sitzung ebenfalls mitten
+        drin beendet, wenn kumulativ das Tageslimit erreicht wird).
+        """
+        if self.total_today_s >= self._setting_s('daily_limit_minutes'):
+            return self._setting_s('reduced_session_minutes')
+        return self._setting_s('session_minutes')
+
+    # --- PIN-Handling (eigene Datei pin.json, atomar, stdlib-only) ---
+
+    def _pin_path(self) -> str:
+        return os.path.join(self._persist_dir(), PIN_FILE)
+
+    def _load_pin_file(self) -> Optional[Dict[str, Any]]:
+        """PIN-Datei lesen. Fehlt sie oder ist sie kaputt => None
+        (= kein PIN konfiguriert, Panel zeigt den Setup-Flow)."""
+        try:
+            with open(self._pin_path(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if not data.get('pin_salt_b64') or not data.get('pin_hash_b64'):
+            return None
+        return data
+
+    def _save_pin_file(self, record: Dict[str, Any]) -> None:
+        """PIN-Datei atomar schreiben (tmp + os.replace)."""
+        path = self._pin_path()
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(record, f)
+            os.replace(tmp, path)
+        except OSError:
+            decky.logger.exception('ScreenTime: Konnte die PIN-Datei nicht schreiben.')
+
+    def _hash_pin(self, pin: str, salt: bytes) -> bytes:
+        return hashlib.pbkdf2_hmac('sha256', pin.encode('utf-8'), salt,
+                                   PIN_ITERATIONS)
+
+    @staticmethod
+    def _valid_pin_len(pin: Any) -> bool:
+        return isinstance(pin, str) and PIN_MIN_LEN <= len(pin) <= PIN_MAX_LEN
+
+    def _verify_pin(self, pin: str) -> bool:
+        """PIN gegen pin.json prüfen (constant-time Vergleich)."""
+        record = self._load_pin_file()
+        if record is None:
+            return False
+        try:
+            salt = base64.b64decode(record['pin_salt_b64'])
+            expected = base64.b64decode(record['pin_hash_b64'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return hmac.compare_digest(self._hash_pin(pin, salt), expected)
+
+    def _pin_record(self, pin: str) -> Dict[str, Any]:
+        salt = os.urandom(PIN_SALT_BYTES)
+        return {
+            'pin_salt_b64': base64.b64encode(salt).decode('ascii'),
+            'pin_hash_b64': base64.b64encode(self._hash_pin(pin, salt)).decode('ascii'),
+            'iterations': PIN_ITERATIONS,
+            'created_at': time.time(),
+        }
+
+    def _is_unlocked(self, now_wall: float) -> bool:
+        """Vorprüfung für jeden geschützten Call: PIN konfiguriert,
+        10-Min-Fenster offen und kein aktiver Lockout."""
+        if self._load_pin_file() is None:
+            return False
+        return now_wall < self.unlocked_until and now_wall >= self.lockout_until
 
     async def _tick_once(self) -> None:
         now_wall = time.time()
@@ -202,8 +342,11 @@ class Plugin:
         # 5) Zustandsmaschine
         if self.state == STATE_BREAKING:
             # Erzwungene Pause: zählt in Wanduhr ab der ersten Suspension.
+            # (Wird nie abgebrochen — auch nicht durch Entsperren; die Länge
+            # wird live aus den Settings gelesen.)
+            break_s = self._setting_s('break_minutes')
             elapsed = now_wall - self.break_start_wall
-            if elapsed >= BREAK_S:
+            if elapsed >= break_s:
                 # Pause vorüber: neue (evtl. verkürzte) Sitzung beginnen.
                 limit = self._current_limit_s()
                 self.state = STATE_PLAYING if self.game_running else STATE_IDLE
@@ -219,7 +362,7 @@ class Plugin:
                 if self.awake_s >= TOAST_AFTER_WAKE_S and not self.break_toast_shown:
                     # Nur kurz wach lassen, damit der Toast lesbar ist.
                     self.break_toast_shown = True
-                    remaining_min = max(1, math.ceil((BREAK_S - elapsed) / 60))
+                    remaining_min = max(1, math.ceil((break_s - elapsed) / 60))
                     await decky.emit('show_break_toast', remaining_min)
                 if (self.awake_s >= TOAST_AFTER_WAKE_S + RESUSPEND_AFTER_TOAST_S
                         and (not self.suspend_pending
@@ -243,21 +386,24 @@ class Plugin:
                 self.session_s += delta_mono
                 self.total_today_s += delta_mono
                 limit = self._current_limit_s()
+                warn_before = self._warn_before_s()
+                daily_limit = self._setting_s('daily_limit_minutes')
                 if (not self.warned
-                        and (self.session_s >= limit - WARN_BEFORE_S
-                             or (total_before < DAILY_LIMIT_S
-                                 and (DAILY_LIMIT_S - self.total_today_s) <= WARN_BEFORE_S))):
+                        and (self.session_s >= limit - warn_before
+                             or (total_before < daily_limit
+                                 and (daily_limit - self.total_today_s) <= warn_before))):
                     # Vorankündigung: kurz vor Sitzungsende oder kurz davor,
-                    # dass kumulativ die 2-Stunden-Marke des Tages erreicht wird.
+                    # dass kumulativ das Tageslimit des Tages erreicht wird.
                     self.warned = True
                     await decky.emit('show_warning')
                 if (self.session_s >= limit
-                        or (total_before < DAILY_LIMIT_S
-                            and self.total_today_s >= DAILY_LIMIT_S)):
-                    # Sitzungsende — auch mitten in der Sitzung, wenn kumulativ die
-                    # 2-Stunden-Marke des Tages erreicht wird. Danach sind neue
-                    # Sitzungen des Tages auf SESSION_REDUCED_S verkürzt; das
-                    # Tageslimit selbst beendet nur die Sitzung, die es überschreitet.
+                        or (total_before < daily_limit
+                            and self.total_today_s >= daily_limit)):
+                    # Sitzungsende — auch mitten in der Sitzung, wenn kumulativ
+                    # das Tageslimit erreicht wird ODER wenn die (jetzt
+                    # konfigurierbare) Sitzungslänge mitten in der Sitzung
+                    # unterschritten wird: Neue Werte gelten sofort, die
+                    # laufende Sitzung endet beim nächsten Tick.
                     self.state = STATE_BREAKING
                     self.break_start_wall = now_wall
                     self.awake_s = 0.0
@@ -328,14 +474,108 @@ class Plugin:
         """Frontend meldet, ob gerade eine Steam-App (Spiel) läuft."""
         self.game_running = bool(is_running)
 
-    async def set_enabled(self, enabled: bool) -> None:
-        """Plugin aktivieren/deaktivieren (wird persistiert)."""
+    async def pin_status(self) -> Dict[str, Any]:
+        """PIN-Zustand für das Panel (offen/lesend, alle 2 s gepollt)."""
+        now = time.time()
+        return {
+            'configured': self._load_pin_file() is not None,
+            'unlocked': self._is_unlocked(now),
+            'lockout_remaining_s': round(max(0.0, self.lockout_until - now), 1),
+        }
+
+    async def setup_pin(self, pin: Any) -> bool:
+        """Erste PIN festlegen — nur solange noch keine existiert."""
+        if self._load_pin_file() is not None or not self._valid_pin_len(pin):
+            return False
+        self._save_pin_file(self._pin_record(pin))
+        # Bewusst NUR die Tatsache loggen: Klartext-PIN und Hash dürfen
+        # nie in Logzeilen landen.
+        decky.logger.info('ScreenTime: PIN eingerichtet.')
+        return True
+
+    async def unlock(self, pin: Any) -> bool:
+        """Entsperren. 5 Fehlversuche => 60 s Lockout; Erfolg resettet den
+        Fehlversuch-Zähler und öffnet das 10-Min-Fenster."""
+        now = time.time()
+        if now < self.lockout_until:
+            return False  # Lockout aktiv
+        if not isinstance(pin, str) or not self._verify_pin(pin):
+            self.failed_unlocks += 1
+            if self.failed_unlocks >= MAX_FAILED_UNLOCK:
+                self.lockout_until = now + LOCKOUT_S
+                # Zähler in die Sperr-Phase gefaltet: nach Ablauf gibt es
+                # wieder 5 frische Versuche.
+                self.failed_unlocks = 0
+            return False
+        self.failed_unlocks = 0
+        self.unlocked_until = now + UNLOCK_TIMEOUT_S
+        return True
+
+    async def lock(self) -> None:
+        """Manuell sperren (offen; wirft das Unlock-Fenster sofort zu)."""
+        self.unlocked_until = 0.0
+
+    async def set_pin(self, current_pin: Any, new_pin: Any) -> bool:
+        """PIN ändern — braucht ein offenes Unlock-Fenster UND die korrekte
+        aktuelle PIN."""
+        if not self._is_unlocked(time.time()):
+            return False
+        if not isinstance(current_pin, str) or not self._verify_pin(current_pin):
+            return False
+        if not self._valid_pin_len(new_pin):
+            return False
+        self._save_pin_file(self._pin_record(new_pin))
+        # Geschützte Aktion: 10-Min-Frist neu setzen.
+        self.unlocked_until = time.time() + UNLOCK_TIMEOUT_S
+        decky.logger.info('ScreenTime: PIN geändert.')
+        return True
+
+    async def get_settings(self) -> Dict[str, Any]:
+        """Aktuelle Einstellungen (offen/lesend, für die Slider-Anzeige)."""
+        return dict(self.settings)
+
+    async def set_settings(self, settings: Any) -> Dict[str, Any]:
+        """Einstellungen ändern (geschützt). Jeder Wert wird serverseitig
+        geclampt — das Backend vertraut den Frontend-Angaben nie. Gesperrt
+        (oder ungültiges Argument) => leeres dict."""
+        now = time.time()
+        if not self._is_unlocked(now):
+            return {}
+        if not isinstance(settings, dict):
+            return {}
+        accepted: Dict[str, int] = {}
+        for key, (_default, lo, hi) in SETTING_SPECS.items():
+            # Aktueller Wert als Fallback: ungültige Mitgaben ändern nichts,
+            # nicht mitgeschickte Keys bleiben unverändert.
+            current = self._clamp_value(self.settings.get(key, _default), lo, hi,
+                                        _default)
+            if key in settings:
+                accepted[key] = self._clamp_value(settings[key], lo, hi, current)
+            else:
+                accepted[key] = current
+        self.settings = accepted
+        # Geschützte Aktion: 10-Min-Frist neu setzen.
+        self.unlocked_until = now + UNLOCK_TIMEOUT_S
+        # Einstellungen sind selten — sofort sichern statt auf den Debounce
+        # zu warten (wie bei set_enabled).
+        self._persist_state(now)
+        self._last_persist_wall = now
+        return dict(accepted)
+
+    async def set_enabled(self, enabled: bool) -> bool:
+        """Plugin aktivieren/deaktivieren (wird persistiert).
+        Geschützt: braucht ein offenes Unlock-Fenster, sonst False."""
+        if not self._is_unlocked(time.time()):
+            return False
         self.enabled = bool(enabled)
         decky.logger.info('ScreenTime: Aktiv=%s.', self.enabled)
         # Aktivierungs-Änderung sofort sichern, nicht erst nach dem Debounce.
         now_wall = time.time()
         self._persist_state(now_wall)
         self._last_persist_wall = now_wall
+        # Geschützte Aktion: 10-Min-Frist neu setzen.
+        self.unlocked_until = now_wall + UNLOCK_TIMEOUT_S
+        return True
 
     async def get_state(self) -> Dict[str, Any]:
         """Aktueller Status für das QAM-Panel (wird alle 2 s gepollt)."""
@@ -346,7 +586,8 @@ class Plugin:
         else:
             session_remaining_s = 0.0
         if self.state == STATE_BREAKING:
-            break_remaining_s = max(0.0, BREAK_S - (now_wall - self.break_start_wall))
+            break_remaining_s = max(0.0, self._setting_s('break_minutes')
+                                    - (now_wall - self.break_start_wall))
         else:
             break_remaining_s = 0.0
         return {
@@ -357,4 +598,6 @@ class Plugin:
             'break_remaining_s': round(break_remaining_s, 1),
             'total_play_min_today': int(round(self.total_today_s / 60.0)),
             'limit_min': int(limit // 60),
+            'pin_configured': self._load_pin_file() is not None,
+            'pin_unlocked': self._is_unlocked(now_wall),
         }
