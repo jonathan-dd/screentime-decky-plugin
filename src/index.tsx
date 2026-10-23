@@ -1,10 +1,13 @@
-import { Button, PanelSection, PanelSectionRow, SliderField, TextField, ToggleField, staticClasses } from "@decky/ui";
+import { Button, ButtonItem, Focusable, PanelSection, PanelSectionRow, SliderField, TextField, ToggleField, staticClasses } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
-import type { CSSProperties } from "react";
-import { FaClock } from "react-icons/fa";
+import type { CSSProperties, ReactNode } from "react";
+import type { IconType } from "react-icons";
+import { FaCalendarDay, FaClock, FaGamepad, FaLock, FaPowerOff, FaSlidersH } from "react-icons/fa";
 
 import { SteamUtils } from "./utils/steam";
+import { STATUS_COLORS, StatusCard } from "./components/StatusCard";
+import type { StatusVisual } from "./components/StatusCard";
 
 // SteamClient wird vom Steam-Client als globale Variable bereitgestellt und
 // ist über @decky/ui global deklariert (GameSessions/Apps-APIs).
@@ -55,26 +58,64 @@ const formatMMSS = (seconds: number): string => {
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 
-const textStyle: CSSProperties = {
-    whiteSpace: "pre-wrap",
-    fontSize: "14px",
+// Minuten als "Xh YYm" (volle Stunden: "Xh"; unter 1 h: "Ym")
+const formatHM = (minutes: number): string => {
+    const m = Math.max(0, Math.floor(minutes));
+    const h = Math.floor(m / 60);
+    const rest = m % 60;
+    if (h <= 0) return `${rest}m`;
+    return rest > 0 ? `${h}h ${String(rest).padStart(2, "0")}m` : `${h}h`;
 };
 
 const hintStyle: CSSProperties = {
-    ...textStyle,
-    color: "#aaa",
+    fontSize: "12px",
+    color: "#aaaaaa",
+    lineHeight: 1.4,
 };
 
 const errorStyle: CSSProperties = {
-    ...textStyle,
+    fontSize: "12px",
     color: "#ff6b6b",
+    lineHeight: 1.4,
 };
 
 const buttonRowStyle: CSSProperties = {
     display: "flex",
     gap: "8px",
-    marginTop: "6px",
+    width: "100%",
+    marginTop: "4px",
 };
+
+const sectionHeaderStyle: CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "10px 2px 4px",
+};
+
+const sectionHeaderTextStyle: CSSProperties = {
+    fontSize: "13px",
+    fontWeight: 600,
+    letterSpacing: "0.5px",
+    textTransform: "uppercase",
+    color: "#8f98a0",
+};
+
+interface SectionHeaderProps {
+    icon: IconType;
+    children: ReactNode;
+}
+
+// Abschnitts-Header im Stil der Steam-Gruppenbeschriftungen: Icon + Text,
+// dezent grau — trennt Status/PIN/Einstellungen im schmalen QAM-Panel.
+const SectionHeader = ({ icon: Icon, children }: SectionHeaderProps) => (
+    <PanelSectionRow>
+        <div style={sectionHeaderStyle}>
+            <Icon size={14} style={{ color: "#8f98a0", flexShrink: 0 }} />
+            <span style={sectionHeaderTextStyle}>{children}</span>
+        </div>
+    </PanelSectionRow>
+);
 
 // PIN-Länge (muss zum Backend passen: 4–8 Zeichen)
 const PIN_MIN = 4;
@@ -264,15 +305,67 @@ function Content() {
         countdown = Math.max(0, polled - elapsed);
     }
 
-    const statusText = !status
-        ? "Status: Lade …"
+    // Gesamt-Länge der aktuellen Phase für den Fortschrittsbalken: Session-
+    // Grenze direkt aus dem Backend (limit_min = aktuelle Session-Länge in
+    // Minuten), Pausen-Länge als Maximum der gesehenen Restzeiten (die
+    // Einstellungen sind im gesperrten Zustand evtl. nicht geladen).
+    // Beim Verlassen des Zustands wird zurückgesetzt. Beides ist idempotent
+    // und darf daher im Render laufen.
+    const sessionTotalS = useRef(0);
+    const breakTotalS = useRef(0);
+    if (poll) {
+        if (poll.s.state === "playing") {
+            sessionTotalS.current = Math.max(
+                sessionTotalS.current,
+                poll.s.session_remaining_s,
+                poll.s.limit_min * 60,
+            );
+        } else {
+            sessionTotalS.current = 0;
+        }
+        if (poll.s.state === "breaking") {
+            breakTotalS.current = Math.max(
+                breakTotalS.current,
+                poll.s.break_remaining_s,
+                settings ? settings.break_minutes * 60 : 0,
+            );
+        } else {
+            breakTotalS.current = 0;
+        }
+    }
+
+    // Balken-Fortschritt: playing = verstrichene Session, breaking =
+    // Pausen-Fortschritt; läuft über die Countdown-Interpolation mit.
+    let progress: number | null = null;
+    if (countdown !== null && status) {
+        if (status.state === "playing" && sessionTotalS.current > 0) {
+            progress = Math.min(1, Math.max(0, 1 - countdown / sessionTotalS.current));
+        } else if (status.state === "breaking" && breakTotalS.current > 0) {
+            progress = Math.min(1, Math.max(0, 1 - countdown / breakTotalS.current));
+        }
+    }
+
+    // Statuszeile: farbiger Punkt + Label (grün = Spielzeit, blau = bereit,
+    // grau = aus/lädt, orange = erzwungene Pause).
+    const statusVisual: StatusVisual = !status
+        ? { color: STATUS_COLORS.off, label: "Lade …" }
         : !status.enabled
-            ? "Status: Aus"
+            ? { color: STATUS_COLORS.off, label: "Aus" }
             : status.state === "playing"
-                ? "Status: Spielzeit läuft"
+                ? { color: STATUS_COLORS.playing, label: "Spielzeit läuft" }
                 : status.state === "breaking"
-                    ? "Status: Erzwungene Pause"
-                    : "Status: Bereit (kein Spiel)";
+                    ? { color: STATUS_COLORS.breaking, label: "Erzwungene Pause" }
+                    : { color: STATUS_COLORS.ready, label: "Bereit (kein Spiel)" };
+
+    const countdownText = countdown !== null ? formatMMSS(countdown) : null;
+
+    // „Heute gespielt": eigene Label-Wert-Zeile; mit geladenen Einstellungen
+    // zusätzlich das Tageslimit als Referenz.
+    const todayText = !status
+        ? "…"
+        : `${formatHM(status.total_play_min_today)}${
+              settings ? ` von ${formatHM(settings.daily_limit_minutes)}` : ""
+          }`;
 
     const setupPinInvalid =
         setupPin.length > 0 && (!pinLengthOk(setupPin) || setupPin !== setupPinConfirm);
@@ -281,30 +374,21 @@ function Content() {
 
     return (
         <PanelSection title="ScreenTime">
+            {/* --- Status --- */}
+            <SectionHeader icon={FaGamepad}>Status</SectionHeader>
             <PanelSectionRow>
-                <div style={textStyle}>{statusText}</div>
+                <StatusCard
+                    visual={statusVisual}
+                    countdown={countdownText}
+                    progress={progress}
+                    todayText={todayText}
+                />
             </PanelSectionRow>
-            {status !== null && (
-                <PanelSectionRow>
-                    <div style={textStyle}>
-                        {`Heute gespielt: ${Math.floor(status.total_play_min_today / 60)}h ${String(status.total_play_min_today % 60).padStart(2, "0")}m`}
-                    </div>
-                </PanelSectionRow>
-            )}
-            {status?.state === "playing" && countdown !== null && (
-                <PanelSectionRow>
-                    <div style={textStyle}>{`Session endet in ${formatMMSS(countdown)}`}</div>
-                </PanelSectionRow>
-            )}
-            {status?.state === "breaking" && countdown !== null && (
-                <PanelSectionRow>
-                    <div style={textStyle}>{`Pause endet in ${formatMMSS(countdown)}`}</div>
-                </PanelSectionRow>
-            )}
 
             {/* --- PIN-Bereich --- */}
             {status !== null && !pinConfigured && (
                 <>
+                    <SectionHeader icon={FaLock}>PIN</SectionHeader>
                     <PanelSectionRow>
                         <div style={hintStyle}>Kein PIN gesetzt — Einstellungen sind ungeschützt. Jetzt PIN festlegen:</div>
                     </PanelSectionRow>
@@ -336,14 +420,19 @@ function Content() {
                         </PanelSectionRow>
                     )}
                     <PanelSectionRow>
-                        <Button onClick={() => void doSetupPin()} disabled={!pinLengthOk(setupPin) || setupPin !== setupPinConfirm}>
+                        <ButtonItem
+                            layout="below"
+                            onClick={() => void doSetupPin()}
+                            disabled={!pinLengthOk(setupPin) || setupPin !== setupPinConfirm}
+                        >
                             PIN festlegen
-                        </Button>
+                        </ButtonItem>
                     </PanelSectionRow>
                 </>
             )}
             {status !== null && pinConfigured && !unlocked && (
                 <>
+                    <SectionHeader icon={FaLock}>PIN</SectionHeader>
                     <PanelSectionRow>
                         <div style={hintStyle}>Gesperrt — zum Ändern von Einstellungen entsperren:</div>
                     </PanelSectionRow>
@@ -367,9 +456,13 @@ function Content() {
                         </PanelSectionRow>
                     )}
                     <PanelSectionRow>
-                        <Button onClick={() => void doUnlock()} disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}>
+                        <ButtonItem
+                            layout="below"
+                            onClick={() => void doUnlock()}
+                            disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}
+                        >
                             Entsperren
-                        </Button>
+                        </ButtonItem>
                     </PanelSectionRow>
                 </>
             )}
@@ -377,8 +470,10 @@ function Content() {
             {/* --- Einstellungen (nur entsperrt) --- */}
             {status !== null && pinConfigured && unlocked && settings !== null && (
                 <>
+                    <SectionHeader icon={FaSlidersH}>Einstellungen</SectionHeader>
                     <PanelSectionRow>
                         <ToggleField
+                            icon={<FaPowerOff />}
                             label="Aktiv"
                             checked={status.enabled}
                             onChange={(checked: boolean) => {
@@ -391,7 +486,7 @@ function Content() {
                     </PanelSectionRow>
                     <PanelSectionRow>
                         <SliderField
-                            label="Sitzungslänge"
+                            label="Session-Länge"
                             value={settings.session_minutes}
                             min={5}
                             max={180}
@@ -413,6 +508,7 @@ function Content() {
                             onChange={(v: number) => onSettingChange("break_minutes", v)}
                         />
                     </PanelSectionRow>
+                    <SectionHeader icon={FaCalendarDay}>Limit &amp; Vorwarnung</SectionHeader>
                     <PanelSectionRow>
                         <SliderField
                             label="Tageslimit"
@@ -427,7 +523,7 @@ function Content() {
                     </PanelSectionRow>
                     <PanelSectionRow>
                         <SliderField
-                            label="Sitzung nach Tageslimit"
+                            label="Session nach Limit"
                             value={settings.reduced_session_minutes}
                             min={1}
                             max={60}
@@ -439,7 +535,7 @@ function Content() {
                     </PanelSectionRow>
                     <PanelSectionRow>
                         <SliderField
-                            label="Vorwarnung"
+                            label="Warn-Vorlauf"
                             value={settings.warn_before_seconds}
                             min={15}
                             max={300}
@@ -449,15 +545,21 @@ function Content() {
                             onChange={(v: number) => onSettingChange("warn_before_seconds", v)}
                         />
                     </PanelSectionRow>
+
+                    {/* PIN-Verwaltung im entsperrten Zustand */}
                     {!changeOpen ? (
-                        <PanelSectionRow>
-                            <div style={buttonRowStyle}>
-                                <Button onClick={() => setChangeOpen(true)}>PIN ändern</Button>
-                                <Button onClick={doLock}>Jetzt sperren</Button>
-                            </div>
-                        </PanelSectionRow>
+                        <>
+                            <SectionHeader icon={FaLock}>PIN</SectionHeader>
+                            <PanelSectionRow>
+                                <Focusable style={buttonRowStyle} flow-children="horizontal">
+                                    <Button style={{ flex: 1 }} onClick={() => setChangeOpen(true)}>PIN ändern</Button>
+                                    <Button style={{ flex: 1 }} onClick={doLock}>Jetzt sperren</Button>
+                                </Focusable>
+                            </PanelSectionRow>
+                        </>
                     ) : (
                         <>
+                            <SectionHeader icon={FaLock}>PIN</SectionHeader>
                             <PanelSectionRow>
                                 <TextField
                                     label="Aktuelle PIN"
@@ -494,14 +596,16 @@ function Content() {
                                 </PanelSectionRow>
                             )}
                             <PanelSectionRow>
-                                <div style={buttonRowStyle}>
+                                <Focusable style={buttonRowStyle} flow-children="horizontal">
                                     <Button
+                                        style={{ flex: 1 }}
                                         onClick={() => void doChangePin()}
                                         disabled={!pinLengthOk(changeNew) || changeNew !== changeNewConfirm || changeCur.length < PIN_MIN}
                                     >
                                         PIN speichern
                                     </Button>
                                     <Button
+                                        style={{ flex: 1 }}
                                         onClick={() => {
                                             setChangeOpen(false);
                                             setChangeCur("");
@@ -512,7 +616,7 @@ function Content() {
                                     >
                                         Abbrechen
                                     </Button>
-                                </div>
+                                </Focusable>
                             </PanelSectionRow>
                         </>
                     )}
