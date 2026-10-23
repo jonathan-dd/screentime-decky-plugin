@@ -373,7 +373,7 @@ function Content() {
         changeNew.length > 0 && (!pinLengthOk(changeNew) || changeNew !== changeNewConfirm);
 
     return (
-        <PanelSection title="ScreenTime">
+        <PanelSection>
             {/* --- Status --- */}
             <SectionHeader icon={FaGamepad}>Status</SectionHeader>
             <PanelSectionRow>
