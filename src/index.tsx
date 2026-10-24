@@ -712,13 +712,22 @@ function Content() {
                                 </PanelSectionRow>
                             )}
                             <PanelSectionRow>
-                                <ButtonItem
-                                    layout="below"
+                                <Button
+                                    style={{
+                                        width: '100%',
+                                        height: '40px',
+                                        fontSize: '15px',
+                                        fontWeight: 600,
+                                        color: '#ffffff',
+                                        background: 'rgba(78, 161, 255, 0.35)',
+                                        border: '1px solid rgba(78, 161, 255, 0.7)',
+                                        borderRadius: '40px',
+                                    }}
                                     onClick={() => void doUnlock()}
                                     disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}
                                 >
                                     Entsperren
-                                </ButtonItem>
+                                </Button>
                             </PanelSectionRow>
                         </>
                     ) : (
