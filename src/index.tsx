@@ -1,4 +1,4 @@
-import { Button, ButtonItem, Focusable, PanelSection, PanelSectionRow, SliderField, TextField, ToggleField, staticClasses } from "@decky/ui";
+import { Button, ButtonItem, Focusable, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
@@ -23,6 +23,9 @@ const lockCall = callable<[], void>("lock");
 const setPinCall = callable<[current_pin: string, new_pin: string], boolean>("set_pin");
 const getSettingsCall = callable<[], ScreenTimeSettings>("get_settings");
 const setSettingsCall = callable<[settings: ScreenTimeSettings], Record<string, number>>("set_settings");
+// v1.4: PIN-Schutz ist abschaltbar (pin_enabled im Backend).
+const getPinProtectionCall = callable<[], PinProtectionState>("get_pin_protection");
+const setPinProtectionCall = callable<[enabled: boolean, pin?: string], PinProtectionResult>("set_pin_protection");
 
 // Status, wie ihn das Backend über get_state() liefert
 interface ScreenTimeState {
@@ -46,10 +49,26 @@ interface ScreenTimeSettings {
     warn_before_seconds: number;
 }
 
+// PIN-Zustand aus pin_status() — 'enabled' = effektiver Schutz (v1.4).
 interface PinStatus {
     configured: boolean;
+    enabled: boolean;
     unlocked: boolean;
     lockout_remaining_s: number;
+}
+
+// PIN-Schutz-Zustand aus get_pin_protection() (v1.4).
+interface PinProtectionState {
+    enabled: boolean;
+    pin_set: boolean;
+    unlocked: boolean;
+}
+
+// Antwort von set_pin_protection() (v1.4): error 'locked' => Erst entsperren,
+// 'pin_required'/'invalid_pin' => beim Aktivieren ohne gültige PIN.
+interface PinProtectionResult {
+    success: boolean;
+    error?: string;
 }
 
 // Sekunden als mm:ss formatieren
@@ -101,6 +120,13 @@ const sectionHeaderTextStyle: CSSProperties = {
     color: "#8f98a0",
 };
 
+// Tab-Icons (Armada-Control-Muster): block-Layout, damit sie im
+// Steam-Tab-Raster sauber sitzen.
+const tabIconStyle: CSSProperties = {
+    display: "block",
+    margin: "0 auto",
+};
+
 interface SectionHeaderProps {
     icon: IconType;
     children: ReactNode;
@@ -125,11 +151,14 @@ const pinLengthOk = (pin: string): boolean =>
     pin.length >= PIN_MIN && pin.length <= PIN_MAX;
 
 function Content() {
+    // Aktiver Tab (Steam rendert die Tab-Leiste + LB/RB-Wechsel selbst).
+    const [tab, setTab] = useState("Status");
+
     // Letzter Poll-Stand: Backend-Antwort + Poll-Zeitpunkt. Die Countdown-
     // Anzeige interpoliert daraus lokal weiter; der 2-s-Poll korrigiert Drift.
     const [poll, setPoll] = useState<{ s: ScreenTimeState; at: number } | null>(null);
-    // Lockout-Restzeit aus pin_status (gleicher 2-s-Zyklus wie get_state).
-    const [pinLockoutS, setPinLockoutS] = useState(0);
+    // PIN-Zustand aus demselben 2-s-Zyklus (Lockout-Anzeige + Schutz-Flag).
+    const [pinStatus, setPinStatus] = useState<PinStatus | null>(null);
     // 250-ms-Tick treibt die lokale Anzeige zwischen den 2-s-Polls an.
     const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
@@ -147,6 +176,8 @@ function Content() {
     const [changeNew, setChangeNew] = useState("");
     const [changeNewConfirm, setChangeNewConfirm] = useState("");
     const [pinError, setPinError] = useState<string | null>(null);
+    // Inline-Setup nach 'PIN-Schutz' aktivieren ohne vorhandene PIN.
+    const [protectionSetupOpen, setProtectionSetupOpen] = useState(false);
 
     // Anzeige lokal im 250-ms-Interval weiterlaufen lassen, statt nur
     // sprunghaft mit jedem 2-s-Poll zu aktualisieren.
@@ -176,7 +207,7 @@ function Content() {
             }
             try {
                 const ps = await pinStatusCall();
-                if (mounted && ps) setPinLockoutS(ps.lockout_remaining_s);
+                if (mounted && ps) setPinStatus(ps);
             } catch {
                 /* pin_status ist optional für die Anzeige */
             }
@@ -194,10 +225,18 @@ function Content() {
     const status = poll?.s ?? null;
     const pinConfigured = status?.pin_configured ?? false;
     const unlocked = status?.pin_unlocked ?? false;
+    const protectionOn = pinStatus?.enabled ?? false;
+    const pinLockoutS = pinStatus?.lockout_remaining_s ?? 0;
 
-    // Einstellungen beim ersten Entsperren laden (get_settings ist offen/lesend).
+    // PIN-Gate: Schutz an und nicht entsperrt => statt der Settings nur das
+    // Gate (Entsperren bzw. Defensive: Setup-Formular ohne PIN). Bei Schutz
+    // aus oder entsperrt sind alle Einstellungen frei editierbar.
+    const gateActive = protectionOn && !unlocked;
+
+    // Einstellungen laden, sobald sie sichtbar sein können (get_settings ist
+    // offen/lesend — auch bei angezogenem Gate darf gelesen werden).
     useEffect(() => {
-        if (!unlocked || settingsRef.current) return;
+        if (gateActive || settingsRef.current) return;
         void getSettingsCall()
             .then((s) => {
                 if (s) {
@@ -206,7 +245,7 @@ function Content() {
                 }
             })
             .catch((e) => console.error("ScreenTime: Einstellungen nicht lesbar.", e));
-    }, [unlocked]);
+    }, [gateActive]);
 
     // Debounced Slider-Batch: alle 400 ms nach der letzten Änderung senden;
     // akzeptierte (geclampte) Werte inline zurückspiegeln. Fehler (z. B.
@@ -253,7 +292,15 @@ function Content() {
         const ok = await setupPinCall(setupPin);
         setSetupPin("");
         setSetupPinConfirm("");
-        setPinError(ok ? null : "PIN konnte nicht festgelegt werden.");
+        if (ok) {
+            // setup_pin aktiviert den Schutz sofort (v1.3.x-Semantik); der
+            // nächste Poll zieht das Panel ins Gate.
+            setProtectionSetupOpen(false);
+            setPinError(null);
+            refreshPinProtection();
+        } else {
+            setPinError("PIN konnte nicht festgelegt werden.");
+        }
     };
 
     const doUnlock = async () => {
@@ -272,6 +319,20 @@ function Content() {
 
     const doChangePin = async () => {
         if (!pinLengthOk(changeNew) || changeNew !== changeNewConfirm) return;
+        // Bei ausgeschaltetem Schutz kann das Unlock-Fenster zu sein — set_pin
+        // braucht es aber (unverändert). Dann erst mit der aktuellen PIN
+        // entsperren; scheitert das, war sie falsch.
+        if (!unlocked) {
+            const okUnlock = await unlockCall(changeCur);
+            if (!okUnlock) {
+                setPinError(
+                    pinLockoutS > 0
+                        ? `Zu viele Fehlversuche — gesperrt (${Math.ceil(pinLockoutS)} s)`
+                        : "Falsche PIN.",
+                );
+                return;
+            }
+        }
         const ok = await setPinCall(changeCur, changeNew);
         if (ok) {
             setChangeOpen(false);
@@ -292,6 +353,60 @@ function Content() {
         setUnlockPin("");
         setPinError(null);
         void lockCall();
+    };
+
+    // Sofortiger Schutz-Refresh nach PIN-Aktionen (der 2-s-Poll zieht
+    // spätestens ebenfalls nach).
+    const refreshPinProtection = () => {
+        void getPinProtectionCall()
+            .then((p) => {
+                if (!p) return;
+                setPinStatus((prev) => ({
+                    configured: p.pin_set,
+                    enabled: p.enabled,
+                    unlocked: p.unlocked,
+                    lockout_remaining_s: prev?.lockout_remaining_s ?? 0,
+                }));
+            })
+            .catch(() => {
+                /* Pin-Status kommt über den 2-s-Poll nach */
+            });
+    };
+
+    const doEnableProtection = async () => {
+        // Ohne vorhandene PIN: Inline-Setup anzeigen (setup_pin schreibt Hash
+        // und aktiviert den Schutz in einem Rutsch — v1.3.x-Semantik).
+        if (!pinConfigured) {
+            setProtectionSetupOpen(true);
+            return;
+        }
+        const res = await setPinProtectionCall(true);
+        if (res?.success) {
+            setPinError(null);
+        } else {
+            setPinError("Schutz konnte nicht aktiviert werden.");
+        }
+        refreshPinProtection();
+    };
+
+    const doDisableProtection = async () => {
+        const res = await setPinProtectionCall(false);
+        if (res?.success) {
+            setPinError(null);
+        } else {
+            // 'locked' => Unlock-Fenster abgelaufen: erst entsperren.
+            setPinError(res?.error === "locked" ? "Erst entsperren." : "Schutz konnte nicht deaktiviert werden.");
+        }
+        refreshPinProtection();
+    };
+
+    const onProtectionToggle = (checked: boolean) => {
+        if (checked) {
+            void doEnableProtection();
+        } else {
+            setProtectionSetupOpen(false);
+            if (pinConfigured) void doDisableProtection();
+        }
     };
 
     // Restzeit (Session/Pause) lokal dekrementieren: seit dem Poll verstrichene
@@ -372,10 +487,57 @@ function Content() {
     const changeNewInvalid =
         changeNew.length > 0 && (!pinLengthOk(changeNew) || changeNew !== changeNewConfirm);
 
-    return (
+    // Setup-Formular (Inline nach 'PIN-Schutz aktivieren' ohne PIN; defensiv
+    // auch im Gate, falls der Schutz an ist aber keine PIN existiert).
+    // Bewusst eine Funktion statt einer Komponente: Die Felder bleiben
+    // direkt im Baum der Eltern-Instanz (kein Remount bei jedem Render).
+    const renderSetupForm = (hint: string) => (
+        <>
+            <PanelSectionRow>
+                <div style={hintStyle}>{hint}</div>
+            </PanelSectionRow>
+            <PanelSectionRow>
+                <TextField
+                    label="PIN (4–8 Zeichen)"
+                    value={setupPin}
+                    bIsPassword
+                    focusOnMount
+                    onChange={(e) => setSetupPin(e.target.value)}
+                />
+            </PanelSectionRow>
+            <PanelSectionRow>
+                <TextField
+                    label="PIN wiederholen"
+                    value={setupPinConfirm}
+                    bIsPassword
+                    onChange={(e) => setSetupPinConfirm(e.target.value)}
+                />
+            </PanelSectionRow>
+            {setupPinInvalid && (
+                <PanelSectionRow>
+                    <div style={errorStyle}>PIN muss 4–8 Zeichen lang sein und übereinstimmen.</div>
+                </PanelSectionRow>
+            )}
+            {pinError && (
+                <PanelSectionRow>
+                    <div style={errorStyle}>{pinError}</div>
+                </PanelSectionRow>
+            )}
+            <PanelSectionRow>
+                <ButtonItem
+                    layout="below"
+                    onClick={() => void doSetupPin()}
+                    disabled={!pinLengthOk(setupPin) || setupPin !== setupPinConfirm}
+                >
+                    PIN festlegen
+                </ButtonItem>
+            </PanelSectionRow>
+        </>
+    );
+
+    // --- Tab 'Status': komplett READ-ONLY (auch bei PIN-Schutz sichtbar) ---
+    const statusTab = (
         <PanelSection>
-            {/* --- Status --- */}
-            <SectionHeader icon={FaGamepad}>Status</SectionHeader>
             <PanelSectionRow>
                 <StatusCard
                     visual={statusVisual}
@@ -384,93 +546,59 @@ function Content() {
                     todayText={todayText}
                 />
             </PanelSectionRow>
+        </PanelSection>
+    );
 
-            {/* --- PIN-Bereich --- */}
-            {status !== null && !pinConfigured && (
+    // --- Tab 'Einstellungen': der komplette interaktive Bereich ---
+    const settingsTab = (
+        <PanelSection>
+            {/* PIN-Gate: Schutz an + nicht entsperrt => KEINE Settings hier. */}
+            {status !== null && gateActive && (
                 <>
                     <SectionHeader icon={FaLock}>PIN</SectionHeader>
-                    <PanelSectionRow>
-                        <div style={hintStyle}>Kein PIN gesetzt — Einstellungen sind ungeschützt. Jetzt PIN festlegen:</div>
-                    </PanelSectionRow>
-                    <PanelSectionRow>
-                        <TextField
-                            label="PIN (4–8 Zeichen)"
-                            value={setupPin}
-                            bIsPassword
-                            focusOnMount
-                            onChange={(e) => setSetupPin(e.target.value)}
-                        />
-                    </PanelSectionRow>
-                    <PanelSectionRow>
-                        <TextField
-                            label="PIN wiederholen"
-                            value={setupPinConfirm}
-                            bIsPassword
-                            onChange={(e) => setSetupPinConfirm(e.target.value)}
-                        />
-                    </PanelSectionRow>
-                    {setupPinInvalid && (
-                        <PanelSectionRow>
-                            <div style={errorStyle}>PIN muss 4–8 Zeichen lang sein und übereinstimmen.</div>
-                        </PanelSectionRow>
+                    {pinConfigured ? (
+                        <>
+                            <PanelSectionRow>
+                                <div style={hintStyle}>Gesperrt — zum Ändern von Einstellungen entsperren:</div>
+                            </PanelSectionRow>
+                            <PanelSectionRow>
+                                <TextField
+                                    label="PIN"
+                                    value={unlockPin}
+                                    bIsPassword
+                                    focusOnMount
+                                    onChange={(e) => setUnlockPin(e.target.value)}
+                                />
+                            </PanelSectionRow>
+                            {pinError && (
+                                <PanelSectionRow>
+                                    <div style={errorStyle}>{pinError}</div>
+                                </PanelSectionRow>
+                            )}
+                            {pinLockoutS > 0 && (
+                                <PanelSectionRow>
+                                    <div style={errorStyle}>{`Zu viele Fehlversuche — entsperrt in ${Math.ceil(pinLockoutS)} s`}</div>
+                                </PanelSectionRow>
+                            )}
+                            <PanelSectionRow>
+                                <ButtonItem
+                                    layout="below"
+                                    onClick={() => void doUnlock()}
+                                    disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}
+                                >
+                                    Entsperren
+                                </ButtonItem>
+                            </PanelSectionRow>
+                        </>
+                    ) : (
+                        renderSetupForm("Kein PIN gesetzt — Einstellungen sind ungeschützt. Jetzt PIN festlegen:")
                     )}
-                    {pinError && (
-                        <PanelSectionRow>
-                            <div style={errorStyle}>{pinError}</div>
-                        </PanelSectionRow>
-                    )}
-                    <PanelSectionRow>
-                        <ButtonItem
-                            layout="below"
-                            onClick={() => void doSetupPin()}
-                            disabled={!pinLengthOk(setupPin) || setupPin !== setupPinConfirm}
-                        >
-                            PIN festlegen
-                        </ButtonItem>
-                    </PanelSectionRow>
-                </>
-            )}
-            {status !== null && pinConfigured && !unlocked && (
-                <>
-                    <SectionHeader icon={FaLock}>PIN</SectionHeader>
-                    <PanelSectionRow>
-                        <div style={hintStyle}>Gesperrt — zum Ändern von Einstellungen entsperren:</div>
-                    </PanelSectionRow>
-                    <PanelSectionRow>
-                        <TextField
-                            label="PIN"
-                            value={unlockPin}
-                            bIsPassword
-                            focusOnMount
-                            onChange={(e) => setUnlockPin(e.target.value)}
-                        />
-                    </PanelSectionRow>
-                    {pinError && (
-                        <PanelSectionRow>
-                            <div style={errorStyle}>{pinError}</div>
-                        </PanelSectionRow>
-                    )}
-                    {pinLockoutS > 0 && (
-                        <PanelSectionRow>
-                            <div style={errorStyle}>{`Zu viele Fehlversuche — entsperrt in ${Math.ceil(pinLockoutS)} s`}</div>
-                        </PanelSectionRow>
-                    )}
-                    <PanelSectionRow>
-                        <ButtonItem
-                            layout="below"
-                            onClick={() => void doUnlock()}
-                            disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}
-                        >
-                            Entsperren
-                        </ButtonItem>
-                    </PanelSectionRow>
                 </>
             )}
 
-            {/* --- Einstellungen (nur entsperrt) --- */}
-            {status !== null && pinConfigured && unlocked && settings !== null && (
+            {/* Entsperrt oder Schutz aus: Settings + PIN-Sektion. */}
+            {status !== null && !gateActive && settings !== null && (
                 <>
-                    <SectionHeader icon={FaSlidersH}>Einstellungen</SectionHeader>
                     <PanelSectionRow>
                         <ToggleField
                             icon={<FaPowerOff />}
@@ -546,16 +674,38 @@ function Content() {
                         />
                     </PanelSectionRow>
 
-                    {/* PIN-Verwaltung im entsperrten Zustand */}
+                    {/* --- PIN-Sektion (v1.4: Schutz hier abschaltbar) --- */}
                     {!changeOpen ? (
                         <>
                             <SectionHeader icon={FaLock}>PIN</SectionHeader>
+                            {pinConfigured && (
+                                <PanelSectionRow>
+                                    <Focusable style={buttonRowStyle} flow-children="horizontal">
+                                        <Button style={{ flex: 1 }} onClick={() => setChangeOpen(true)}>PIN ändern</Button>
+                                        <Button style={{ flex: 1 }} onClick={doLock}>Jetzt sperren</Button>
+                                    </Focusable>
+                                </PanelSectionRow>
+                            )}
                             <PanelSectionRow>
-                                <Focusable style={buttonRowStyle} flow-children="horizontal">
-                                    <Button style={{ flex: 1 }} onClick={() => setChangeOpen(true)}>PIN ändern</Button>
-                                    <Button style={{ flex: 1 }} onClick={doLock}>Jetzt sperren</Button>
-                                </Focusable>
+                                <ToggleField
+                                    icon={<FaLock />}
+                                    label="PIN-Schutz"
+                                    checked={protectionOn || protectionSetupOpen}
+                                    onChange={onProtectionToggle}
+                                />
                             </PanelSectionRow>
+                            {!pinConfigured && !protectionSetupOpen && (
+                                <PanelSectionRow>
+                                    <div style={hintStyle}>Kein PIN gesetzt — Einstellungen sind ungeschützt.</div>
+                                </PanelSectionRow>
+                            )}
+                            {protectionSetupOpen &&
+                                renderSetupForm("PIN festlegen, um Einstellungen und Aktiv-Schalter zu schützen:")}
+                            {!protectionSetupOpen && pinError && (
+                                <PanelSectionRow>
+                                    <div style={errorStyle}>{pinError}</div>
+                                </PanelSectionRow>
+                            )}
                         </>
                     ) : (
                         <>
@@ -623,6 +773,25 @@ function Content() {
                 </>
             )}
         </PanelSection>
+    );
+
+    return (
+        <Tabs
+            activeTab={tab}
+            onShowTab={(shown: string) => setTab(shown)}
+            tabs={[
+                {
+                    id: "Status",
+                    title: <FaGamepad size={18} style={tabIconStyle} />,
+                    content: statusTab,
+                },
+                {
+                    id: "Einstellungen",
+                    title: <FaSlidersH size={18} style={tabIconStyle} />,
+                    content: settingsTab,
+                },
+            ]}
+        />
     );
 }
 

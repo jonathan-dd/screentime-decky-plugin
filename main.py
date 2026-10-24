@@ -31,10 +31,12 @@ TICK_S = 1.0                    # Tick-Intervall des Hintergrund-Loops
 PERSIST_DEBOUNCE_S = 10.0       # Statusdatei sparsam schreiben: max. alle 10 s
 STATE_FILE = 'state.json'
 
-# --- PIN-Schutz ---
-# Einstellungen und der Aktiv-Schalter sind gesperrt, bis per PIN entsperrt
-# wurde. Nach dem Entsperren bleibt das Panel 10 Minuten offen; jede
-# geschützte Aktion setzt die Frist neu.
+# --- PIN-Schutz (seit v1.4 abschaltbar über pin_enabled in pin.json) ---
+# Einstellungen und der Aktiv-Schalter sind gesperrt, solange der Schutz
+# AKTIV ist und nicht per PIN entsperrt wurde. Legacy-pin.json (Hash ohne
+# pin_enabled-Feld) zählt wie in v1.3.x als aktiv; fehlt der Hash, ist der
+# Schutz AUS — egal was das Feld sagt. Nach dem Entsperren bleibt das Panel
+# 10 Minuten offen; jede geschützte Aktion setzt die Frist neu.
 PIN_FILE = 'pin.json'           # bewusst SEPARAT von state.json: 'PIN vergessen'
                                 # => pin.json per Konsole löschen => Setup-Flow
 PIN_ITERATIONS = 100_000        # PBKDF2-HMAC-SHA256
@@ -74,6 +76,10 @@ class Plugin:
       - setup_pin(pin):               Erste PIN festlegen (nur solange keine existiert)
       - unlock(pin)/lock():           Entsperren (Rate-Limit) / manuell sperren
       - set_pin(current_pin, new_pin): PIN ändern (braucht Unlock + aktuelle PIN)
+      - get_pin_protection():         Schutz-Zustand {enabled, pin_set, unlocked}
+      - set_pin_protection(e, pin):   Schutz an/aus — an ohne Unlock (ohne PIN
+                                      muss eine gültige PIN mitgegeben werden),
+                                      aus nur mit offenen Unlock-Fenster
     """
 
     def __init__(self):
@@ -269,13 +275,16 @@ class Plugin:
             return False
         return hmac.compare_digest(self._hash_pin(pin, salt), expected)
 
-    def _pin_record(self, pin: str) -> Dict[str, Any]:
+    def _pin_record(self, pin: str, enabled: bool) -> Dict[str, Any]:
+        """Vollständiger pin.json-Satz inkl. Schutz-Flag — Flag und Hash
+        landen atomar in EINEM Schreibvorgang."""
         salt = os.urandom(PIN_SALT_BYTES)
         return {
             'pin_salt_b64': base64.b64encode(salt).decode('ascii'),
             'pin_hash_b64': base64.b64encode(self._hash_pin(pin, salt)).decode('ascii'),
             'iterations': PIN_ITERATIONS,
             'created_at': time.time(),
+            'pin_enabled': bool(enabled),
         }
 
     def _is_unlocked(self, now_wall: float) -> bool:
@@ -284,6 +293,25 @@ class Plugin:
         if self._load_pin_file() is None:
             return False
         return now_wall < self.unlocked_until and now_wall >= self.lockout_until
+
+    def _pin_protection_active(self) -> bool:
+        """Effektiver PIN-Schutz: PIN vorhanden UND pin_enabled an.
+        Legacy-pin.json (pin_hash, aber kein pin_enabled-Feld) zählt wie in
+        v1.3.x als AKTIV (Feld-Default True beim Lesen) und wird beim nächsten
+        Schreiben explizit persistiert. Ohne pin_hash ist der Schutz AUS,
+        egal was das Feld sonst sagt."""
+        record = self._load_pin_file()
+        if record is None:
+            return False
+        return bool(record.get('pin_enabled', True))
+
+    def _settings_allowed(self, now_wall: float) -> bool:
+        """Gate für Settings und Aktiv-Schalter: Bei ausgeschaltetem Schutz
+        sind alle Schreibzugriffe frei (kein Unlock nötig); sonst gilt das
+        Unlock-Fenster wie in v1.3.x."""
+        if not self._pin_protection_active():
+            return True
+        return self._is_unlocked(now_wall)
 
     async def _tick_once(self) -> None:
         now_wall = time.time()
@@ -479,6 +507,7 @@ class Plugin:
         now = time.time()
         return {
             'configured': self._load_pin_file() is not None,
+            'enabled': self._pin_protection_active(),
             'unlocked': self._is_unlocked(now),
             'lockout_remaining_s': round(max(0.0, self.lockout_until - now), 1),
         }
@@ -487,7 +516,10 @@ class Plugin:
         """Erste PIN festlegen — nur solange noch keine existiert."""
         if self._load_pin_file() is not None or not self._valid_pin_len(pin):
             return False
-        self._save_pin_file(self._pin_record(pin))
+        # Wie in v1.3.x: Eine frisch eingerichtete PIN schützt sofort
+        # (pin_enabled wird atomar mitgeschrieben; abschaltbar nur per
+        # Entsperren über set_pin_protection).
+        self._save_pin_file(self._pin_record(pin, enabled=True))
         # Bewusst NUR die Tatsache loggen: Klartext-PIN und Hash dürfen
         # nie in Logzeilen landen.
         decky.logger.info('ScreenTime: PIN eingerichtet.')
@@ -524,22 +556,75 @@ class Plugin:
             return False
         if not self._valid_pin_len(new_pin):
             return False
-        self._save_pin_file(self._pin_record(new_pin))
+        # pin_enabled des bisherigen Satzes übernehmen (Legacy-Sätze ohne
+        # Feld zählen als aktiv und werden hiermit explizit persistiert).
+        enabled = self._pin_protection_active()
+        self._save_pin_file(self._pin_record(new_pin, enabled))
         # Geschützte Aktion: 10-Min-Frist neu setzen.
         self.unlocked_until = time.time() + UNLOCK_TIMEOUT_S
         decky.logger.info('ScreenTime: PIN geändert.')
         return True
+
+    async def get_pin_protection(self) -> Dict[str, Any]:
+        """Schutz-Zustand für das Panel (offen/lesend): enabled = effektiver
+        Schutz, pin_set = PIN vorhanden, unlocked = Unlock-Fenster offen."""
+        now = time.time()
+        return {
+            'enabled': self._pin_protection_active(),
+            'pin_set': self._load_pin_file() is not None,
+            'unlocked': self._is_unlocked(now),
+        }
+
+    async def set_pin_protection(self, enabled: Any, pin: Any = None) -> Dict[str, Any]:
+        """PIN-Schutz an-/ausschalten (v1.4).
+
+        Aktivieren ist ohne Unlock erlaubt. Existiert noch keine PIN, MUSS
+        eine gültige PIN (4–8 Zeichen) mitgegeben werden — sie wird atomar
+        zusammen mit dem Flag in pin.json gespeichert. Deaktivieren geht nur
+        mit offenem Unlock-Fenster, sonst Fehler 'locked' (das Frontend
+        zeigt dann 'Erst entsperren')."""
+        now = time.time()
+        record = self._load_pin_file()
+        if enabled:
+            if record is None:
+                # Keine PIN vorhanden: pin muss mitkommen und gültig sein.
+                if not self._valid_pin_len(pin):
+                    error = 'invalid_pin' if pin is not None else 'pin_required'
+                    return {'success': False, 'error': error}
+                self._save_pin_file(self._pin_record(pin, enabled=True))
+                decky.logger.info('ScreenTime: PIN-Schutz mit neuer PIN aktiviert.')
+            elif record.get('pin_enabled') is not True:
+                # PIN vorhanden: nur das Flag setzen. Legacy-Sätze ohne Feld
+                # werden dabei explizit persistiert ('beim nächsten Schreiben').
+                new_record = dict(record)
+                new_record['pin_enabled'] = True
+                self._save_pin_file(new_record)
+                decky.logger.info('ScreenTime: PIN-Schutz aktiviert.')
+            return {'success': True}
+        # Deaktivieren: NUR mit gültigem Unlock-Fenster. Ist der Schutz
+        # bereits aus (keine PIN oder Flag aus), ist es ein Noop => Erfolg,
+        # ohne dass ein Unlock verlangt wird (nichts wird geändert).
+        if not self._pin_protection_active() or record is None:
+            return {'success': True}
+        if not self._is_unlocked(now):
+            return {'success': False, 'error': 'locked'}
+        new_record = dict(record)
+        new_record['pin_enabled'] = False
+        self._save_pin_file(new_record)
+        decky.logger.info('ScreenTime: PIN-Schutz deaktiviert.')
+        return {'success': True}
 
     async def get_settings(self) -> Dict[str, Any]:
         """Aktuelle Einstellungen (offen/lesend, für die Slider-Anzeige)."""
         return dict(self.settings)
 
     async def set_settings(self, settings: Any) -> Dict[str, Any]:
-        """Einstellungen ändern (geschützt). Jeder Wert wird serverseitig
-        geclampt — das Backend vertraut den Frontend-Angaben nie. Gesperrt
-        (oder ungültiges Argument) => leeres dict."""
+        """Einstellungen ändern (geschützt bei aktivem PIN-Schutz). Jeder Wert
+        wird serverseitig geclampt — das Backend vertraut den Frontend-Angaben
+        nie. Gesperrt (oder ungültiges Argument) => leeres dict; bei
+        ausgeschaltetem Schutz ohne Unlock frei."""
         now = time.time()
-        if not self._is_unlocked(now):
+        if not self._settings_allowed(now):
             return {}
         if not isinstance(settings, dict):
             return {}
@@ -554,8 +639,12 @@ class Plugin:
             else:
                 accepted[key] = current
         self.settings = accepted
-        # Geschützte Aktion: 10-Min-Frist neu setzen.
-        self.unlocked_until = now + UNLOCK_TIMEOUT_S
+        if self._is_unlocked(now):
+            # Geschützte Aktion: 10-Min-Frist neu setzen — aber nur, wenn
+            # wirklich ein Fenster offen war. Bei ausgeschaltetem Schutz darf
+            # ein Settings-Write kein Fenster 'gratis' öffnen, sonst wäre
+            # set_pin ohne Entsperren erreichbar.
+            self.unlocked_until = now + UNLOCK_TIMEOUT_S
         # Einstellungen sind selten — sofort sichern statt auf den Debounce
         # zu warten (wie bei set_enabled).
         self._persist_state(now)
@@ -564,8 +653,9 @@ class Plugin:
 
     async def set_enabled(self, enabled: bool) -> bool:
         """Plugin aktivieren/deaktivieren (wird persistiert).
-        Geschützt: braucht ein offenes Unlock-Fenster, sonst False."""
-        if not self._is_unlocked(time.time()):
+        Geschützt bei aktivem PIN-Schutz: braucht ein offenes Unlock-Fenster,
+        sonst False; bei ausgeschaltetem Schutz frei."""
+        if not self._settings_allowed(time.time()):
             return False
         self.enabled = bool(enabled)
         decky.logger.info('ScreenTime: Aktiv=%s.', self.enabled)
@@ -573,8 +663,10 @@ class Plugin:
         now_wall = time.time()
         self._persist_state(now_wall)
         self._last_persist_wall = now_wall
-        # Geschützte Aktion: 10-Min-Frist neu setzen.
-        self.unlocked_until = now_wall + UNLOCK_TIMEOUT_S
+        if self._is_unlocked(now_wall):
+            # Geschützte Aktion: Frist neu setzen — nur bei offenem Fenster
+            # (siehe set_settings: kein Gratis-Unlock bei Schutz aus).
+            self.unlocked_until = now_wall + UNLOCK_TIMEOUT_S
         return True
 
     async def get_state(self) -> Dict[str, Any]:
