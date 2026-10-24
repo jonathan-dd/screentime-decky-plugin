@@ -1,4 +1,4 @@
-import { Button, ButtonItem, Focusable, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
+import { Button, ButtonItem, Focusable, gamepadTabbedPageClasses, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
@@ -122,6 +122,54 @@ const sectionHeaderTextStyle: CSSProperties = {
 
 // Tab-Icons (Armada-Control-Muster): block-Layout, damit sie im
 // Steam-Tab-Raster sauber sitzen.
+// Fix für vertikal abgeschnittenen Tab-Content im QAM (Muster Armada Control):
+// Explizite Höhenkette Wrapper -> Tabs-Root -> TabContentsScroll, sonst kollabiert
+// der Scroll-Bereich und Content wird am unteren Rand abgeschnitten.
+const { TabContents, TabContentsScroll } = gamepadTabbedPageClasses;
+const tabStyles = `
+      .screentime-tabs {
+        width: 100%;
+        height: 95vh;
+        min-width: 0;
+        min-height: 0;
+      }
+      .screentime-tabs > div {
+        height: 100%;
+        min-height: 0;
+      }
+      .screentime-tabs .${TabContents},
+      .screentime-tabs .${TabContentsScroll} {
+        min-width: 0;
+        min-height: 0;
+      }
+      .screentime-tabs .${TabContentsScroll} {
+        padding-left: 0;
+        padding-right: 0;
+      }
+      .screentime-tabs [role="tablist"] {
+        display: flex;
+        flex-wrap: nowrap;
+        justify-content: center;
+      }
+      .screentime-tabs [role="tab"] {
+        flex: 0 1 auto;
+        min-width: 0;
+        box-sizing: border-box;
+        padding-left: 6px;
+        padding-right: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .screentime-tabs [role="tab"] svg {
+        display: block;
+        margin: 0;
+      }
+      .screentime-tab-content {
+        padding-bottom: 24px;
+      }
+`;
+
 const tabIconStyle: CSSProperties = {
     display: "block",
     margin: "0 auto",
@@ -537,6 +585,7 @@ function Content() {
 
     // --- Tab 'Status': komplett READ-ONLY (auch bei PIN-Schutz sichtbar) ---
     const statusTab = (
+    <div className="screentime-tab-content">
         <PanelSection>
             <PanelSectionRow>
                 <StatusCard
@@ -547,10 +596,12 @@ function Content() {
                 />
             </PanelSectionRow>
         </PanelSection>
+    </div>
     );
 
     // --- Tab 'Einstellungen': der komplette interaktive Bereich ---
     const settingsTab = (
+    <div className="screentime-tab-content">
         <PanelSection>
             {/* PIN-Gate: Schutz an + nicht entsperrt => KEINE Settings hier. */}
             {status !== null && gateActive && (
@@ -773,9 +824,12 @@ function Content() {
                 </>
             )}
         </PanelSection>
+    </div>
     );
 
     return (
+        <div className="screentime-tabs">
+        <style>{tabStyles}</style>
         <Tabs
             activeTab={tab}
             onShowTab={(shown: string) => setTab(shown)}
@@ -792,6 +846,7 @@ function Content() {
                 },
             ]}
         />
+        </div>
     );
 }
 
