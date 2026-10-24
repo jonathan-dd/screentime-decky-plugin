@@ -682,14 +682,14 @@ class Plugin:
     async def get_history(self) -> Dict[str, Any]:
         """Spielzeit der letzten 7 Kalendertage (offen/lesend, nicht PIN-gated).
 
-        Liefert die Tage aufsteigend (ältester zuerst) mit deutschem
+        Liefert die Tage absteigend (heute zuerst) mit deutschem
         Wochentags-Kürzel; der heutige Tag kommt live aus dem Zähler."""
         days = []
         try:
             base = time.mktime(time.strptime(self.day, '%Y-%m-%d'))
         except (TypeError, ValueError):
             base = time.time()
-        for offset in range(6, -1, -1):
+        for offset in range(0, 7):
             day = time.strftime('%Y-%m-%d', time.localtime(base - offset * 86400))
             if day == self.day:
                 minutes = int(round(self.total_today_s / 60.0))
