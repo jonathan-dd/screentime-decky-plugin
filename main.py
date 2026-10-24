@@ -30,6 +30,8 @@ SUSPEND_RETRY_S = 5.0           # Suspend fehlgeschlagen => alle 5 s erneut anfo
 TICK_S = 1.0                    # Tick-Intervall des Hintergrund-Loops
 PERSIST_DEBOUNCE_S = 10.0       # Statusdatei sparsam schreiben: max. alle 10 s
 STATE_FILE = 'state.json'
+HISTORY_FILE = 'history.json'   # Tag -> gespielte Sekunden (Kurzhistorie)
+HISTORY_MAX_DAYS = 30           # Aufbewahrung: 30 Kalendertage
 
 # --- PIN-Schutz (seit v1.4 abschaltbar über pin_enabled in pin.json) ---
 # Einstellungen und der Aktiv-Schalter sind gesperrt, solange der Schutz
@@ -69,6 +71,7 @@ class Plugin:
 
     IPC-Methoden (aus dem Frontend via @decky/api callable aufrufbar):
       - set_game_running(is_running): Frontend meldet Start/Stop einer Steam-App
+      - get_history():                Spielzeit der letzten 7 Tage (offen/lesend)
       - set_enabled(enabled):         Plugin an/aus (persistiert, PIN-geschützt)
       - get_state():                  Status für das QAM-Panel
       - get_settings()/set_settings(): Einstellungen lesen/ändern (ändern: geschützt)
@@ -90,6 +93,7 @@ class Plugin:
         self.total_today_s = 0.0
         self.day = time.strftime('%Y-%m-%d')
         self.settings: Dict[str, int] = dict(DEFAULT_SETTINGS)
+        self.history: Dict[str, float] = {}   # 'YYYY-MM-DD' -> Sekunden
         # Laufzeitzustand
         self.state = STATE_IDLE
         self.game_running = False
@@ -125,6 +129,59 @@ class Plugin:
     def _state_path(self) -> str:
         return os.path.join(self._persist_dir(), STATE_FILE)
 
+    # --- Kurzhistorie (history.json: Tag -> Sekunden, separat von state) ---
+
+    def _history_path(self) -> str:
+        return os.path.join(self._persist_dir(), HISTORY_FILE)
+
+    def _load_history(self) -> None:
+        """Gespeicherte Historie laden; kaputte Datei => leere Historie."""
+        try:
+            with open(self._history_path(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        clean: Dict[str, float] = {}
+        for day, seconds in data.items():
+            # Key-Format prüfen (YYYY-MM-DD); Müll-Keys und Werte <= 0 verwerfen
+            # (die Historie führt nur tatsächlich gespielte Tage).
+            try:
+                time.strptime(str(day), '%Y-%m-%d')
+                secs = float(seconds)
+            except (TypeError, ValueError):
+                continue
+            if secs > 0.0:
+                clean[str(day)] = secs
+        self.history = clean
+
+    def _save_history(self) -> None:
+        """Historie atomar schreiben (tmp + os.replace), auf 30 Tage gekappt."""
+        keep = sorted(self.history.keys())[-HISTORY_MAX_DAYS:]
+        capped = {day: self.history[day] for day in keep}
+        self.history = capped
+        path = self._history_path()
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(capped, f)
+            os.replace(tmp, path)
+        except OSError:
+            decky.logger.exception('ScreenTime: Konnte die Historie nicht schreiben.')
+
+    def _record_history_for(self, day: str, seconds: Any) -> None:
+        """Einen abgeschlossenen Tag in die Historie übernehmen (nur echte Werte)."""
+        try:
+            time.strptime(str(day), '%Y-%m-%d')
+            secs = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return
+        if secs <= 0.0:
+            return
+        self.history[str(day)] = round(secs, 1)
+        self._save_history()
+
     def _load_state(self) -> None:
         """Gespeicherten Stand beim Start laden; fehlende/kaputte Datei => Defaults."""
         try:
@@ -144,8 +201,10 @@ class Plugin:
             except (TypeError, ValueError):
                 self.total_today_s = 0.0
         else:
-            # Gespeicherter Stand gehört zu einem früheren Tag: Tageszähler
-            # um Mitternacht zurücksetzen.
+            # Gespeicherter Stand gehört zu einem früheren Tag: den Endstand
+            # in die Historie übernehmen, dann den Tageszähler zurücksetzen.
+            self._record_history_for(str(data.get('day')),
+                                     data.get('total_play_seconds'))
             self.day = today
             self.total_today_s = 0.0
         # Einstellungen: fehlende Keys => Default; Werte clampen (Hand-Edit
@@ -352,6 +411,9 @@ class Plugin:
         # 2) Datumswechsel: Tageszähler um Mitternacht zurücksetzen.
         today = time.strftime('%Y-%m-%d')
         if today != self.day:
+            # Tageswechsel: den alten Tagesstand in die Historie übernehmen,
+            # dann den Zähler um Mitternacht zurücksetzen.
+            self._record_history_for(self.day, self.total_today_s)
             self.day = today
             self.total_today_s = 0.0
 
@@ -473,6 +535,7 @@ class Plugin:
         self.last_wall = time.time()
         self.last_mono = time.monotonic()
         self._load_state()
+        self._load_history()
         decky.logger.info(
             'ScreenTime: Plugin geladen (aktiv=%s, Status=%s, heute gespielt: %.0f s).',
             self.enabled, self.state, self.total_today_s,
@@ -613,6 +676,33 @@ class Plugin:
         self._save_pin_file(new_record)
         decky.logger.info('ScreenTime: PIN-Schutz deaktiviert.')
         return {'success': True}
+
+    _WEEKDAYS_DE = ('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')
+
+    async def get_history(self) -> Dict[str, Any]:
+        """Spielzeit der letzten 7 Kalendertage (offen/lesend, nicht PIN-gated).
+
+        Liefert die Tage aufsteigend (ältester zuerst) mit deutschem
+        Wochentags-Kürzel; der heutige Tag kommt live aus dem Zähler."""
+        days = []
+        try:
+            base = time.mktime(time.strptime(self.day, '%Y-%m-%d'))
+        except (TypeError, ValueError):
+            base = time.time()
+        for offset in range(6, -1, -1):
+            day = time.strftime('%Y-%m-%d', time.localtime(base - offset * 86400))
+            if day == self.day:
+                minutes = int(round(self.total_today_s / 60.0))
+                label = 'Heute'
+            else:
+                minutes = int(round(self.history.get(day, 0.0) / 60.0))
+                try:
+                    wday = time.strptime(day, '%Y-%m-%d').tm_wday  # 0=Montag
+                    label = self._WEEKDAYS_DE[wday]
+                except (TypeError, ValueError):
+                    label = ''
+            days.append({'date': day, 'day_label': label, 'minutes': minutes})
+        return {'days': days}
 
     async def get_settings(self) -> Dict[str, Any]:
         """Aktuelle Einstellungen (offen/lesend, für die Slider-Anzeige)."""

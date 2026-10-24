@@ -1,6 +1,6 @@
 {
     "name": "screentime-decky-plugin",
-    "version": "1.4.1",
+    "version": "1.5.0",
     "description": "ScreenTime: Erzwungene Spielpausen für die Steam Deck — Sitzungen begrenzen und Pausen per Ruhemodus durchsetzen.",
     "type": "module",
     "scripts": {

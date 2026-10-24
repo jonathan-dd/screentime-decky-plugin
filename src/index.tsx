@@ -1,6 +1,6 @@
 import { Button, ButtonItem, Focusable, gamepadTabbedPageClasses, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import type { IconType } from "react-icons";
 import { FaCalendarDay, FaClock, FaGamepad, FaLock, FaPowerOff, FaSlidersH } from "react-icons/fa";
@@ -25,6 +25,13 @@ const getSettingsCall = callable<[], ScreenTimeSettings>("get_settings");
 const setSettingsCall = callable<[settings: ScreenTimeSettings], Record<string, number>>("set_settings");
 // v1.4: PIN-Schutz ist abschaltbar (pin_enabled im Backend).
 const getPinProtectionCall = callable<[], PinProtectionState>("get_pin_protection");
+export interface HistoryEntry {
+    date: string;
+    day_label: string;
+    minutes: number;
+}
+interface HistoryResponse { days: HistoryEntry[]; }
+const getHistoryCall = callable<[], HistoryResponse>("get_history");
 const setPinProtectionCall = callable<[enabled: boolean, pin?: string], PinProtectionResult>("set_pin_protection");
 
 // Status, wie ihn das Backend über get_state() liefert
@@ -227,12 +234,33 @@ function Content() {
     // Inline-Setup nach 'PIN-Schutz' aktivieren ohne vorhandene PIN.
     const [protectionSetupOpen, setProtectionSetupOpen] = useState(false);
 
+    // Verlauf (7 Tage): geladen initial + bei Tab-Wechsel + 60-s-Refresh.
+    const [history, setHistory] = useState<HistoryEntry[] | null>(null);
+    const [activeTab, setActiveTab] = useState('Status');
+    const doLoadHistory = useCallback(async () => {
+        try {
+            const res = await getHistoryCall();
+            setHistory(res.days ?? []);
+        } catch {
+            setHistory(null);
+        }
+    }, []);
+
     // Anzeige lokal im 250-ms-Interval weiterlaufen lassen, statt nur
     // sprunghaft mit jedem 2-s-Poll zu aktualisieren.
     useEffect(() => {
         const timer = setInterval(() => setNowTick(Date.now()), 250);
         return () => clearInterval(timer);
     }, []);
+
+    // Verlauf: initial laden und aktualisieren, wenn der Verlauf-Tab offen ist
+    // (oder das Panel frisch gemountet wurde); alle 60 s im Hintergrund frischhalten.
+    useEffect(() => {
+        void doLoadHistory();
+        if (activeTab !== 'Verlauf') return;
+        const t = setInterval(() => void doLoadHistory(), 60_000);
+        return () => clearInterval(t);
+    }, [activeTab, doLoadHistory]);
 
     // Status alle 2 s pollen, solange das Panel geöffnet ist (Synchronisation).
     useEffect(() => {
@@ -599,6 +627,58 @@ function Content() {
     </div>
     );
 
+    // --- Tab 'Verlauf': Spielzeit der letzten 7 Tage (Mo..So, ältester zuerst) ---
+    const fmtMin = (m: number) => (m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`);
+
+    const dayBarRowStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, width: '100%', minWidth: 0 };
+    const dayBarLabelStyle: CSSProperties = { width: 34, flexShrink: 0, opacity: 0.8, fontSize: 13 };
+    const dayBarTrackStyle: CSSProperties = { flex: 1, minWidth: 0, height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.16)' };
+    const dayBarValueStyle: CSSProperties = { width: 62, flexShrink: 0, textAlign: 'right', fontSize: 12, opacity: 0.85, fontVariantNumeric: 'tabular-nums' };
+
+    const maxHistoryMin = Math.max(
+        settings?.daily_limit_minutes ?? 0,
+        ...(history ?? []).map((d) => d.minutes),
+        1,
+    );
+
+    const historyTab = (
+    <div className="screentime-tab-content">
+        <PanelSection>
+            <SectionHeader icon={FaCalendarDay}>Letzte 7 Tage</SectionHeader>
+            {history === null ? (
+                <PanelSectionRow>
+                    <div style={hintStyle}>Lade Verlauf …</div>
+                </PanelSectionRow>
+            ) : (
+                history.map((d) => (
+                    <PanelSectionRow key={d.date}>
+                        <div style={dayBarRowStyle}>
+                            <div style={dayBarLabelStyle}>{d.day_label || d.date.slice(5)}</div>
+                            <div style={dayBarTrackStyle}>
+                                <div style={{
+                                    height: '100%',
+                                    width: `${Math.min(100, (d.minutes / maxHistoryMin) * 100)}%`,
+                                    borderRadius: 3,
+                                    background: d.date === history[history.length - 1]?.date
+                                        ? '#4ea1ff'
+                                        : 'rgba(78,161,255,0.55)',
+                                    transition: 'width 250ms linear',
+                                }} />
+                            </div>
+                            <div style={dayBarValueStyle}>{fmtMin(d.minutes)}</div>
+                        </div>
+                    </PanelSectionRow>
+                ))
+            )}
+            {settings?.daily_limit_minutes ? (
+                <PanelSectionRow>
+                    <div style={hintStyle}>{`Balken skaliert auf ${fmtMin(settings.daily_limit_minutes)} (Tageslimit).`}</div>
+                </PanelSectionRow>
+            ) : null}
+        </PanelSection>
+    </div>
+    );
+
     // --- Tab 'Einstellungen': der komplette interaktive Bereich ---
     const settingsTab = (
     <div className="screentime-tab-content">
@@ -832,12 +912,17 @@ function Content() {
         <style>{tabStyles}</style>
         <Tabs
             activeTab={tab}
-            onShowTab={(shown: string) => setTab(shown)}
+            onShowTab={(shown: string) => { setTab(shown); setActiveTab(shown); }}
             tabs={[
                 {
                     id: "Status",
                     title: <FaGamepad size={18} style={tabIconStyle} />,
                     content: statusTab,
+                },
+                {
+                    id: "Verlauf",
+                    title: <FaCalendarDay size={18} style={tabIconStyle} />,
+                    content: historyTab,
                 },
                 {
                     id: "Einstellungen",
