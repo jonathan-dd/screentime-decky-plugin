@@ -177,6 +177,13 @@ const tabStyles = `
       }
 `;
 
+const accentButtonStyle: CSSProperties = {
+    color: '#ffffff',
+    background: 'rgba(78, 161, 255, 0.35)',
+    border: '1px solid rgba(78, 161, 255, 0.7)',
+    borderRadius: '40px',
+};
+
 const tabIconStyle: CSSProperties = {
     display: "block",
     margin: "0 auto",
@@ -714,14 +721,11 @@ function Content() {
                             <PanelSectionRow>
                                 <Button
                                     style={{
+                                        ...accentButtonStyle,
                                         width: '100%',
                                         height: '40px',
                                         fontSize: '15px',
                                         fontWeight: 600,
-                                        color: '#ffffff',
-                                        background: 'rgba(78, 161, 255, 0.35)',
-                                        border: '1px solid rgba(78, 161, 255, 0.7)',
-                                        borderRadius: '40px',
                                     }}
                                     onClick={() => void doUnlock()}
                                     disabled={unlockPin.length < PIN_MIN || pinLockoutS > 0}
@@ -821,8 +825,8 @@ function Content() {
                             {pinConfigured && (
                                 <PanelSectionRow>
                                     <Focusable style={buttonRowStyle} flow-children="horizontal">
-                                        <Button style={{ flex: 1 }} onClick={() => setChangeOpen(true)}>PIN ändern</Button>
-                                        <Button style={{ flex: 1 }} onClick={doLock}>Jetzt sperren</Button>
+                                        <Button style={{ ...accentButtonStyle, flex: 1, height: '36px', fontSize: '14px', fontWeight: 600 }} onClick={() => setChangeOpen(true)}>PIN ändern</Button>
+                                        <Button style={{ ...accentButtonStyle, flex: 1, height: '36px', fontSize: '14px', fontWeight: 600 }} onClick={doLock}>Jetzt sperren</Button>
                                     </Focusable>
                                 </PanelSectionRow>
                             )}
@@ -888,14 +892,14 @@ function Content() {
                             <PanelSectionRow>
                                 <Focusable style={buttonRowStyle} flow-children="horizontal">
                                     <Button
-                                        style={{ flex: 1 }}
                                         onClick={() => void doChangePin()}
                                         disabled={!pinLengthOk(changeNew) || changeNew !== changeNewConfirm || changeCur.length < PIN_MIN}
+                                        style={{ ...accentButtonStyle, flex: 1, height: '36px', fontSize: '14px', fontWeight: 600 }}
                                     >
                                         PIN speichern
                                     </Button>
                                     <Button
-                                        style={{ flex: 1 }}
+                                        style={{ flex: 1, height: '36px', fontSize: '14px' }}
                                         onClick={() => {
                                             setChangeOpen(false);
                                             setChangeCur("");
