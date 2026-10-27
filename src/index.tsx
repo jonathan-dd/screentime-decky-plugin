@@ -969,6 +969,13 @@ export default definePlugin(() => {
         toaster.toast({ title: "ScreenTime", body: `Pause beendet — wieder ${limitMin} Minuten Spielzeit.` });
     };
 
+    const onSuspendGaveUp = (attempts: number) => {
+        toaster.toast({
+            title: "ScreenTime",
+            body: `Suspend nach ${attempts} Versuchen aufgegeben — die Pause läuft ohne Zwangs-Ruhemodus weiter.`,
+        });
+    };
+
     const onSuspendNow = () => {
         // Wie AlarMe: 3 s warten, bis der Steam-UI (Toasts/Events) bereit ist —
         // ein sofortiger Aufruf schlägt sonst still fehl. Wiederholte Emits des
@@ -981,6 +988,7 @@ export default definePlugin(() => {
     addEventListener("show_break_toast", onShowBreakToast);
     addEventListener("break_over", onBreakOver);
     addEventListener("suspend_now", onSuspendNow);
+    addEventListener("suspend_gave_up", onSuspendGaveUp);
 
     // --- Spiel-Erkennung: Steam-App-Starts/Stops verfolgen ---
     // Set-basiertes Tracking laufender App-IDs (Muster aus dem AlarMe-Plugin),
@@ -1044,6 +1052,7 @@ export default definePlugin(() => {
             removeEventListener("show_break_toast", onShowBreakToast);
             removeEventListener("break_over", onBreakOver);
             removeEventListener("suspend_now", onSuspendNow);
+            removeEventListener("suspend_gave_up", onSuspendGaveUp);
             unregisterGameLifetime?.();
         },
     };

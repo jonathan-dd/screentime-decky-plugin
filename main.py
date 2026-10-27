@@ -27,6 +27,9 @@ MANUAL_SUSPEND_GAP_S = 30.0     # Wanduhr-Sprung > 30 s zwischen Ticks => Suspen
 TOAST_AFTER_WAKE_S = 20.0       # In der Pause: Toast erst nach 20 Sekunden Wachzeit
 RESUSPEND_AFTER_TOAST_S = 10.0  # In der Pause: 10 s nach dem Toast erneut Ruhemodus
 SUSPEND_RETRY_S = 5.0           # Suspend fehlgeschlagen => alle 5 s erneut anfordern
+MAX_SUSPEND_ATTEMPTS = 5        # Hard-Cap: pro Pause-Episode max. 5 Suspend-Versuche;
+                                # danach lässt das Plugin das Gerät in Ruhe (Safety-
+                                # Valve gegen Wake/Suspend-Endlosschleifen).
 TICK_S = 1.0                    # Tick-Intervall des Hintergrund-Loops
 PERSIST_DEBOUNCE_S = 10.0       # Statusdatei sparsam schreiben: max. alle 10 s
 STATE_FILE = 'state.json'
@@ -102,6 +105,9 @@ class Plugin:
         self.break_start_wall = 0.0   # Wanduhr-Zeitpunkt des Pausenbeginns
         self.awake_s = 0.0            # Wachzeit seit dem letzten Wake (in der Pause)
         self.suspend_pending = False  # Suspend ausgelöst, auf Wake warten
+        # Suspend-Versuche der AKTUELLEN Pause-Episode (Hard-Cap
+        # MAX_SUSPEND_ATTEMPTS); Reset bei jedem Pausen-Beginn, NICHT beim Wake.
+        self.suspend_attempts = 0
         # Wachzeit-Marke des letzten suspend_now-Emits (Tick-basiert, zur
         # Retry-Logik in der Pause): seit dieser Marke >= 5 s wach => erneut emit.
         self.last_suspend_emit = 0.0
@@ -394,6 +400,7 @@ class Plugin:
                     self.break_start_wall = self.last_wall
                     self.awake_s = 0.0
                     self.break_toast_shown = False
+                    self.suspend_attempts = 0
                 else:
                     # Manueller Sleep vor der Warn-Marke: Sitzung verwerfen,
                     # der Timer startet beim Aufwachen neu.
@@ -457,14 +464,22 @@ class Plugin:
                 if (self.awake_s >= TOAST_AFTER_WAKE_S + RESUSPEND_AFTER_TOAST_S
                         and (not self.suspend_pending
                              or (self.awake_s - self.last_suspend_emit) >= SUSPEND_RETRY_S)):
-                    # Erneut in den Ruhemodus, bis die Pause um ist. suspend_pending
-                    # sorgt nur für den ersten Emit sofort nach dem Wake (Toast bleibt
-                    # davor lesbar); ist das Gerät danach weiterhin wach, ist der
-                    # Suspend fehlgeschlagen => alle 5 s erneut anfordern, bis der
-                    # Wanduhr-Sprung den Suspend bestätigt (Retry-Marke last_suspend_emit).
-                    self.suspend_pending = True
-                    self.last_suspend_emit = self.awake_s
-                    await decky.emit('suspend_now')
+                    # Erneut in den Ruhemodus, bis die Pause um ist — aber max.
+                    # MAX_SUSPEND_ATTEMPTS Versuche pro Pause-Episode (Hard-Cap
+                    # gegen Wake/Suspend-Endlosschleifen; danach bleibt das
+                    # Gerät wach, die Pause zählt in Wanduhr weiter).
+                    if self.suspend_attempts >= MAX_SUSPEND_ATTEMPTS:
+                        self.suspend_pending = False
+                    else:
+                        self.suspend_attempts += 1
+                        if self.suspend_attempts == MAX_SUSPEND_ATTEMPTS:
+                            # Letzter Versuch: Nutzer informieren, dass danach
+                            # Schluss ist (einmalig, über den Cap-Event).
+                            await decky.emit('suspend_gave_up',
+                                             MAX_SUSPEND_ATTEMPTS)
+                        self.suspend_pending = True
+                        self.last_suspend_emit = self.awake_s
+                        await decky.emit('suspend_now')
         elif self.game_running:
             if self.state == STATE_IDLE:
                 self.state = STATE_PLAYING
@@ -498,6 +513,7 @@ class Plugin:
                     self.break_start_wall = now_wall
                     self.awake_s = 0.0
                     self.break_toast_shown = False
+                    self.suspend_attempts = 1  # der Emit unten ist Versuch #1
                     # Erster Suspend beim Sitzungsende — bleibt wie er ist. Schlägt er
                     # fehl (Gerät bleibt wach), greift ab awake_s >= 30 (Toast nach 20 s
                     # + 10 s) die Retry-Logik unten: alle 5 s erneut, bis der
