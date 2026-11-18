@@ -1,7 +1,8 @@
-import { Button, ButtonItem, Focusable, gamepadTabbedPageClasses, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
+import { Button, ButtonItem, ErrorBoundary, Focusable, findModuleByExport, gamepadTabbedPageClasses, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
+import type { Tab, TabsProps } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties, FC, ReactNode } from "react";
 import type { IconType } from "react-icons";
 import { FaCalendarDay, FaClock, FaGamepad, FaLock, FaPowerOff, FaSlidersH } from "react-icons/fa";
 
@@ -132,7 +133,46 @@ const sectionHeaderTextStyle: CSSProperties = {
 // Fix für vertikal abgeschnittenen Tab-Content im QAM (Muster Armada Control):
 // Explizite Höhenkette Wrapper -> Tabs-Root -> TabContentsScroll, sonst kollabiert
 // der Scroll-Bereich und Content wird am unteren Rand abgeschnitten.
-const { TabContents, TabContentsScroll } = gamepadTabbedPageClasses;
+// ?? {}: gamepadTabbedPageClasses ist ebenfalls ein Laufzeit-Module-Find —
+// ist es undefined (Steam-UI-Chunks beim Plugin-Import noch nicht da), darf
+// das Destructuring NICHT schon den ganzen Plugin-Import sprengen. Die
+// CSS-Selektoren laufen dann ins Leere, aber das Plugin lädt weiter.
+const { TabContents, TabContentsScroll } = gamepadTabbedPageClasses ?? {};
+
+// --- Tabs-Verfügbarkeit (Robustheit nach dem Aufwachen, v1.5.5) -----------
+// Tabs ist KEINE fixe Komponente: @decky/ui fischt sie beim Plugin-Import
+// per Webpack-Find aus der Steam-UI — einmalig, per String-Match auf
+// ".TabRowTabs". Wird das Plugin-Frontend neu geladen, während die Steam-UI
+// ihre Chunks noch nicht registriert hat (typisch nach dem Aufwachen aus dem
+// Ruhemodus), schlägt der Find fehl und Tabs bleibt dauerhaft undefined.
+// Ein blindes Rendern crasht dann („Minified React error #130") und lässt
+// das QAM-Panel KOMPLETT leer hängen, bis ein Plugin-Reload kommt — ein
+// bekanntes Decky-Problem (vgl. decky-loader #964/#918). Deshalb: dasselbe
+// Find hier noch einmal als Funktion, damit das Panel beim Mount erneut
+// suchen kann; bis das Modul da ist, rendert es ein Fallback-Layout
+// (s. Content) statt zu crashen.
+//
+// Typ-Hinweis: Decky deklariert Tab.title als string, die Steam-Komponente
+// rendert aber auch ReactNode (dieses Plugin setzt Icons als Titel).
+type ScreenTimeTab = Omit<Tab, "title"> & { title: ReactNode };
+type TabsComponent = FC<Omit<TabsProps, "tabs"> & { tabs: ScreenTimeTab[] }>;
+
+const findTabsModule = (): TabsComponent | undefined => {
+    try {
+        const tabsModule = findModuleByExport(
+            (e: any) =>
+                e?.toString?.()?.includes(".TabRowTabs") &&
+                e?.toString?.()?.includes("activeTab:"),
+        );
+        if (!tabsModule) return undefined;
+        const comp = Object.values(tabsModule).find((e: any) =>
+            e?.type?.toString?.()?.includes("(function()"),
+        );
+        return typeof comp === "function" ? (comp as TabsComponent) : undefined;
+    } catch {
+        return undefined;
+    }
+};
 const tabStyles = `
       .screentime-tabs {
         width: 100%;
@@ -216,6 +256,14 @@ function Content() {
     // Aktiver Tab (Steam rendert die Tab-Leiste + LB/RB-Wechsel selbst).
     const [tab, setTab] = useState("Status");
 
+    // Verfügbare Tabs-Komponente: Der Import aus @decky/ui kann nach dem
+    // Aufwachen undefined sein (Import-Zeit-Find, s. findTabsModule). Beim
+    // Mount erneut suchen; solange sie fehlt, zeigt das Panel das
+    // Fallback-Layout, statt komplett leer zu bleiben.
+    const [tabsComp, setTabsComp] = useState<TabsComponent | null>(() =>
+        typeof Tabs === "function" ? (Tabs as TabsComponent) : null,
+    );
+
     // Letzter Poll-Stand: Backend-Antwort + Poll-Zeitpunkt. Die Countdown-
     // Anzeige interpoliert daraus lokal weiter; der 2-s-Poll korrigiert Drift.
     const [poll, setPoll] = useState<{ s: ScreenTimeState; at: number } | null>(null);
@@ -268,6 +316,25 @@ function Content() {
         const t = setInterval(() => void doLoadHistory(), 60_000);
         return () => clearInterval(t);
     }, [activeTab, doLoadHistory]);
+
+    // Fehlende Tabs-Komponente periodisch neu suchen (max. 60 Versuche à 1 s):
+    // Registriert die Steam-UI das Modul später (typisch nach dem Aufwachen),
+    // heilen die Tabs ohne Plugin-Reload von selbst. Sobald die Komponente
+    // gefunden wurde, stellt der Effect über den tabsComp-State um.
+    useEffect(() => {
+        if (tabsComp) return;
+        let attempts = 0;
+        const retry = setInterval(() => {
+            attempts += 1;
+            const resolved = findTabsModule();
+            if (resolved) {
+                setTabsComp(resolved);
+            } else if (attempts >= 60) {
+                clearInterval(retry);
+            }
+        }, 1000);
+        return () => clearInterval(retry);
+    }, [tabsComp]);
 
     // Status alle 2 s pollen, solange das Panel geöffnet ist (Synchronisation).
     useEffect(() => {
@@ -690,6 +757,19 @@ function Content() {
     const settingsTab = (
     <div className="screentime-tab-content">
         <PanelSection>
+            {/* Lade-Zustände statt leerer Fläche: Fehlen status/settings noch
+                (Backend startet gerade oder antwortet nicht), sagt der Tab es
+                mindestens — vorher sah das wie „kaputt/nichts" aus. */}
+            {status === null && (
+                <PanelSectionRow>
+                    <div style={hintStyle}>Status wird geladen …</div>
+                </PanelSectionRow>
+            )}
+            {status !== null && !gateActive && settings === null && (
+                <PanelSectionRow>
+                    <div style={hintStyle}>Einstellungen werden geladen …</div>
+                </PanelSectionRow>
+            )}
             {/* PIN-Gate: Schutz an + nicht entsperrt => KEINE Settings hier. */}
             {status !== null && gateActive && (
                 <>
@@ -920,10 +1000,44 @@ function Content() {
     </div>
     );
 
+    // Fallback, solange die Tabs-Komponente fehlt (Steam-UI-Modul nach dem
+    // Aufwachen noch nicht registriert): Alle Bereiche untereinander statt
+    // Tab-Navigation — das Panel bleibt benutzbar, statt komplett leer zu
+    // hängen. Der Retry-Effect oben schaltet zurück, sobald das Modul da ist.
+    if (!tabsComp) {
+        return (
+            <div>
+                <PanelSection>
+                    <PanelSectionRow>
+                        <div style={hintStyle}>
+                            Tab-Navigation ist gerade nicht verfügbar (Steam-UI-Modul fehlt,
+                            meist direkt nach dem Aufwachen). Die Bereiche stehen bis dahin
+                            untereinander; ein Plugin-Reload (Decky → ScreenTime) stellt die
+                            Tabs sofort wieder her.
+                        </div>
+                    </PanelSectionRow>
+                </PanelSection>
+                <PanelSection>
+                    <SectionHeader icon={FaGamepad}>Status</SectionHeader>
+                </PanelSection>
+                {statusTab}
+                <PanelSection>
+                    <SectionHeader icon={FaCalendarDay}>Verlauf</SectionHeader>
+                </PanelSection>
+                {historyTab}
+                <PanelSection>
+                    <SectionHeader icon={FaSlidersH}>Einstellungen</SectionHeader>
+                </PanelSection>
+                {settingsTab}
+            </div>
+        );
+    }
+
+    const TabsComp = tabsComp;
     return (
         <div className="screentime-tabs">
         <style>{tabStyles}</style>
-        <Tabs
+        <TabsComp
             activeTab={tab}
             onShowTab={(shown: string) => { setTab(shown); setActiveTab(shown); }}
             tabs={[
@@ -1041,10 +1155,22 @@ export default definePlugin(() => {
         /* Best effort — Methode fehlt je nach Steam-Version */
     }
 
+    // ErrorBoundary ist ebenfalls ein Laufzeit-Module-Find und kann selbst
+    // undefined sein — deshalb nur einbinden, wenn es existiert. Fängt
+    // Render-Crashes ab (z. B. nach Steam-Updates): Steam zeigt dann seine
+    // Fehlerkarte, statt das Panel komplett leer zu lassen.
+    const content = typeof ErrorBoundary === "function" ? (
+        <ErrorBoundary>
+            <Content />
+        </ErrorBoundary>
+    ) : (
+        <Content />
+    );
+
     return {
         name: "ScreenTime",
-        titleView: <div className={staticClasses.Title}>ScreenTime</div>,
-        content: <Content />,
+        titleView: <div className={staticClasses?.Title ?? ""}>ScreenTime</div>,
+        content,
         icon: <FaClock />,
         onDismount() {
             // Alle hängenden Listener entfernen
