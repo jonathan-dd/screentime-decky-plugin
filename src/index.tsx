@@ -1,8 +1,7 @@
-import { Button, ButtonItem, ErrorBoundary, Focusable, findModuleByExport, gamepadTabbedPageClasses, PanelSection, PanelSectionRow, SliderField, Tabs, TextField, ToggleField, staticClasses } from "@decky/ui";
-import type { Tab, TabsProps } from "@decky/ui";
+import { Button, ButtonItem, ErrorBoundary, Focusable, PanelSection, PanelSectionRow, SliderField, TextField, ToggleField, staticClasses } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties, FC, ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { IconType } from "react-icons";
 import { FaCalendarDay, FaClock, FaGamepad, FaLock, FaPowerOff, FaSlidersH } from "react-icons/fa";
 
@@ -128,105 +127,18 @@ const sectionHeaderTextStyle: CSSProperties = {
     color: "#8f98a0",
 };
 
-// Tab-Icons (Armada-Control-Muster): block-Layout, damit sie im
-// Steam-Tab-Raster sauber sitzen.
-// Fix für vertikal abgeschnittenen Tab-Content im QAM (Muster Armada Control):
-// Explizite Höhenkette Wrapper -> Tabs-Root -> TabContentsScroll, sonst kollabiert
-// der Scroll-Bereich und Content wird am unteren Rand abgeschnitten.
-// ?? {}: gamepadTabbedPageClasses ist ebenfalls ein Laufzeit-Module-Find —
-// ist es undefined (Steam-UI-Chunks beim Plugin-Import noch nicht da), darf
-// das Destructuring NICHT schon den ganzen Plugin-Import sprengen. Die
-// CSS-Selektoren laufen dann ins Leere, aber das Plugin lädt weiter.
-const { TabContents, TabContentsScroll } = gamepadTabbedPageClasses ?? {};
-
-// --- Tabs-Verfügbarkeit (Robustheit nach dem Aufwachen, v1.5.5) -----------
-// Tabs ist KEINE fixe Komponente: @decky/ui fischt sie beim Plugin-Import
-// per Webpack-Find aus der Steam-UI — einmalig, per String-Match auf
-// ".TabRowTabs". Wird das Plugin-Frontend neu geladen, während die Steam-UI
-// ihre Chunks noch nicht registriert hat (typisch nach dem Aufwachen aus dem
-// Ruhemodus), schlägt der Find fehl und Tabs bleibt dauerhaft undefined.
-// Ein blindes Rendern crasht dann („Minified React error #130") und lässt
-// das QAM-Panel KOMPLETT leer hängen, bis ein Plugin-Reload kommt — ein
-// bekanntes Decky-Problem (vgl. decky-loader #964/#918). Deshalb: dasselbe
-// Find hier noch einmal als Funktion, damit das Panel beim Mount erneut
-// suchen kann; bis das Modul da ist, rendert es ein Fallback-Layout
-// (s. Content) statt zu crashen.
-//
-// Typ-Hinweis: Decky deklariert Tab.title als string, die Steam-Komponente
-// rendert aber auch ReactNode (dieses Plugin setzt Icons als Titel).
-type ScreenTimeTab = Omit<Tab, "title"> & { title: ReactNode };
-type TabsComponent = FC<Omit<TabsProps, "tabs"> & { tabs: ScreenTimeTab[] }>;
-
-const findTabsModule = (): TabsComponent | undefined => {
-    try {
-        const tabsModule = findModuleByExport(
-            (e: any) =>
-                e?.toString?.()?.includes(".TabRowTabs") &&
-                e?.toString?.()?.includes("activeTab:"),
-        );
-        if (!tabsModule) return undefined;
-        const comp = Object.values(tabsModule).find((e: any) =>
-            e?.type?.toString?.()?.includes("(function()"),
-        );
-        return typeof comp === "function" ? (comp as TabsComponent) : undefined;
-    } catch {
-        return undefined;
-    }
-};
-const tabStyles = `
-      .screentime-tabs {
-        width: 100%;
-        height: 95vh;
-        min-width: 0;
-        min-height: 0;
-      }
-      .screentime-tabs > div {
-        height: 100%;
-        min-height: 0;
-      }
-      .screentime-tabs .${TabContents},
-      .screentime-tabs .${TabContentsScroll} {
-        min-width: 0;
-        min-height: 0;
-      }
-      .screentime-tabs .${TabContentsScroll} {
-        padding-left: 0;
-        padding-right: 0;
-      }
-      .screentime-tabs [role="tablist"] {
-        display: flex;
-        flex-wrap: nowrap;
-        justify-content: center;
-      }
-      .screentime-tabs [role="tab"] {
-        flex: 0 1 auto;
-        min-width: 0;
-        box-sizing: border-box;
-        padding-left: 6px;
-        padding-right: 6px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-      .screentime-tabs [role="tab"] svg {
-        display: block;
-        margin: 0;
-      }
-      .screentime-tab-content {
-        padding-bottom: 24px;
-      }
-`;
+// Kein <Tabs>-Layout mehr (v1.5.6): Die Steam-UI-Komponente wird per
+// Webpack-Module-Find zur Laufzeit gesucht und war auf aktuellen
+// Steam-Builds nicht mehr auffindbar — das Panel lief dauerhaft im
+// v1.5.5-Fallback. Statt Tabs samt Höhenketten-CSS jetzt bewusst die
+// einfache gestapelte Ansicht: Status, Verlauf und Einstellungen
+// untereinander (s. Content).
 
 const accentButtonStyle: CSSProperties = {
     color: '#ffffff',
     background: 'rgba(78, 161, 255, 0.35)',
     border: '1px solid rgba(78, 161, 255, 0.7)',
     borderRadius: '40px',
-};
-
-const tabIconStyle: CSSProperties = {
-    display: "block",
-    margin: "0 auto",
 };
 
 interface SectionHeaderProps {
@@ -253,17 +165,6 @@ const pinLengthOk = (pin: string): boolean =>
     pin.length >= PIN_MIN && pin.length <= PIN_MAX;
 
 function Content() {
-    // Aktiver Tab (Steam rendert die Tab-Leiste + LB/RB-Wechsel selbst).
-    const [tab, setTab] = useState("Status");
-
-    // Verfügbare Tabs-Komponente: Der Import aus @decky/ui kann nach dem
-    // Aufwachen undefined sein (Import-Zeit-Find, s. findTabsModule). Beim
-    // Mount erneut suchen; solange sie fehlt, zeigt das Panel das
-    // Fallback-Layout, statt komplett leer zu bleiben.
-    const [tabsComp, setTabsComp] = useState<TabsComponent | null>(() =>
-        typeof Tabs === "function" ? (Tabs as TabsComponent) : null,
-    );
-
     // Letzter Poll-Stand: Backend-Antwort + Poll-Zeitpunkt. Die Countdown-
     // Anzeige interpoliert daraus lokal weiter; der 2-s-Poll korrigiert Drift.
     const [poll, setPoll] = useState<{ s: ScreenTimeState; at: number } | null>(null);
@@ -289,9 +190,8 @@ function Content() {
     // Inline-Setup nach 'PIN-Schutz' aktivieren ohne vorhandene PIN.
     const [protectionSetupOpen, setProtectionSetupOpen] = useState(false);
 
-    // Verlauf (7 Tage): geladen initial + bei Tab-Wechsel + 60-s-Refresh.
+    // Verlauf (7 Tage): beim Mount laden, danach alle 60 s frisch halten.
     const [history, setHistory] = useState<HistoryEntry[] | null>(null);
-    const [activeTab, setActiveTab] = useState('Status');
     const doLoadHistory = useCallback(async () => {
         try {
             const res = await getHistoryCall();
@@ -308,33 +208,12 @@ function Content() {
         return () => clearInterval(timer);
     }, []);
 
-    // Verlauf: initial laden und aktualisieren, wenn der Verlauf-Tab offen ist
-    // (oder das Panel frisch gemountet wurde); alle 60 s im Hintergrund frischhalten.
+    // Verlauf: initial laden und alle 60 s im Hintergrund frisch halten.
     useEffect(() => {
         void doLoadHistory();
-        if (activeTab !== 'Verlauf') return;
         const t = setInterval(() => void doLoadHistory(), 60_000);
         return () => clearInterval(t);
-    }, [activeTab, doLoadHistory]);
-
-    // Fehlende Tabs-Komponente periodisch neu suchen (max. 60 Versuche à 1 s):
-    // Registriert die Steam-UI das Modul später (typisch nach dem Aufwachen),
-    // heilen die Tabs ohne Plugin-Reload von selbst. Sobald die Komponente
-    // gefunden wurde, stellt der Effect über den tabsComp-State um.
-    useEffect(() => {
-        if (tabsComp) return;
-        let attempts = 0;
-        const retry = setInterval(() => {
-            attempts += 1;
-            const resolved = findTabsModule();
-            if (resolved) {
-                setTabsComp(resolved);
-            } else if (attempts >= 60) {
-                clearInterval(retry);
-            }
-        }, 1000);
-        return () => clearInterval(retry);
-    }, [tabsComp]);
+    }, [doLoadHistory]);
 
     // Status alle 2 s pollen, solange das Panel geöffnet ist (Synchronisation).
     useEffect(() => {
@@ -685,10 +564,10 @@ function Content() {
         </>
     );
 
-    // --- Tab 'Status': komplett READ-ONLY (auch bei PIN-Schutz sichtbar) ---
-    const statusTab = (
-    <div className="screentime-tab-content">
+    // --- Status: komplett READ-ONLY (auch bei PIN-Schutz sichtbar) ---
+    const statusSection = (
         <PanelSection>
+            <SectionHeader icon={FaGamepad}>Status</SectionHeader>
             <PanelSectionRow>
                 <StatusCard
                     visual={statusVisual}
@@ -698,10 +577,9 @@ function Content() {
                 />
             </PanelSectionRow>
         </PanelSection>
-    </div>
     );
 
-    // --- Tab 'Verlauf': Spielzeit der letzten 7 Tage (Mo..So, ältester zuerst) ---
+    // --- Verlauf: Spielzeit der letzten 7 Tage (Mo..So, ältester zuerst) ---
     const fmtMin = (m: number) => (m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`);
 
     const dayBarRowStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, width: '100%', minWidth: 0 };
@@ -715,8 +593,7 @@ function Content() {
         1,
     );
 
-    const historyTab = (
-    <div className="screentime-tab-content">
+    const historySection = (
         <PanelSection>
             <SectionHeader icon={FaCalendarDay}>Letzte 7 Tage</SectionHeader>
             {history === null ? (
@@ -750,13 +627,12 @@ function Content() {
                 </PanelSectionRow>
             ) : null}
         </PanelSection>
-    </div>
     );
 
-    // --- Tab 'Einstellungen': der komplette interaktive Bereich ---
-    const settingsTab = (
-    <div className="screentime-tab-content">
+    // --- Einstellungen: der komplette interaktive Bereich ---
+    const settingsSection = (
         <PanelSection>
+            <SectionHeader icon={FaSlidersH}>Einstellungen</SectionHeader>
             {/* Lade-Zustände statt leerer Fläche: Fehlen status/settings noch
                 (Backend startet gerade oder antwortet nicht), sagt der Tab es
                 mindestens — vorher sah das wie „kaputt/nichts" aus. */}
@@ -997,67 +873,15 @@ function Content() {
                 </>
             )}
         </PanelSection>
-    </div>
     );
 
-    // Fallback, solange die Tabs-Komponente fehlt (Steam-UI-Modul nach dem
-    // Aufwachen noch nicht registriert): Alle Bereiche untereinander statt
-    // Tab-Navigation — das Panel bleibt benutzbar, statt komplett leer zu
-    // hängen. Der Retry-Effect oben schaltet zurück, sobald das Modul da ist.
-    if (!tabsComp) {
-        return (
-            <div>
-                <PanelSection>
-                    <PanelSectionRow>
-                        <div style={hintStyle}>
-                            Tab-Navigation ist gerade nicht verfügbar (Steam-UI-Modul fehlt,
-                            meist direkt nach dem Aufwachen). Die Bereiche stehen bis dahin
-                            untereinander; ein Plugin-Reload (Decky → ScreenTime) stellt die
-                            Tabs sofort wieder her.
-                        </div>
-                    </PanelSectionRow>
-                </PanelSection>
-                <PanelSection>
-                    <SectionHeader icon={FaGamepad}>Status</SectionHeader>
-                </PanelSection>
-                {statusTab}
-                <PanelSection>
-                    <SectionHeader icon={FaCalendarDay}>Verlauf</SectionHeader>
-                </PanelSection>
-                {historyTab}
-                <PanelSection>
-                    <SectionHeader icon={FaSlidersH}>Einstellungen</SectionHeader>
-                </PanelSection>
-                {settingsTab}
-            </div>
-        );
-    }
-
-    const TabsComp = tabsComp;
+    // Gestapelte Ansicht (v1.5.6): Status, Verlauf und Einstellungen
+    // untereinander — kein Tab-Raster, das QAM-Panel scrollt selbst.
     return (
-        <div className="screentime-tabs">
-        <style>{tabStyles}</style>
-        <TabsComp
-            activeTab={tab}
-            onShowTab={(shown: string) => { setTab(shown); setActiveTab(shown); }}
-            tabs={[
-                {
-                    id: "Status",
-                    title: <FaGamepad size={18} style={tabIconStyle} />,
-                    content: statusTab,
-                },
-                {
-                    id: "Verlauf",
-                    title: <FaCalendarDay size={18} style={tabIconStyle} />,
-                    content: historyTab,
-                },
-                {
-                    id: "Einstellungen",
-                    title: <FaSlidersH size={18} style={tabIconStyle} />,
-                    content: settingsTab,
-                },
-            ]}
-        />
+        <div style={{ paddingBottom: "24px" }}>
+            {statusSection}
+            {historySection}
+            {settingsSection}
         </div>
     );
 }
@@ -1083,13 +907,6 @@ export default definePlugin(() => {
         toaster.toast({ title: "ScreenTime", body: `Pause beendet — wieder ${limitMin} Minuten Spielzeit.` });
     };
 
-    const onSuspendGaveUp = (attempts: number) => {
-        toaster.toast({
-            title: "ScreenTime",
-            body: `Suspend nach ${attempts} Versuchen aufgegeben — die Pause läuft ohne Zwangs-Ruhemodus weiter.`,
-        });
-    };
-
     const onSuspendNow = () => {
         // Wie AlarMe: 3 s warten, bis der Steam-UI (Toasts/Events) bereit ist —
         // ein sofortiger Aufruf schlägt sonst still fehl. Wiederholte Emits des
@@ -1102,7 +919,6 @@ export default definePlugin(() => {
     addEventListener("show_break_toast", onShowBreakToast);
     addEventListener("break_over", onBreakOver);
     addEventListener("suspend_now", onSuspendNow);
-    addEventListener("suspend_gave_up", onSuspendGaveUp);
 
     // --- Spiel-Erkennung: Steam-App-Starts/Stops verfolgen ---
     // Set-basiertes Tracking laufender App-IDs (Muster aus dem AlarMe-Plugin),
@@ -1178,7 +994,6 @@ export default definePlugin(() => {
             removeEventListener("show_break_toast", onShowBreakToast);
             removeEventListener("break_over", onBreakOver);
             removeEventListener("suspend_now", onSuspendNow);
-            removeEventListener("suspend_gave_up", onSuspendGaveUp);
             unregisterGameLifetime?.();
         },
     };
